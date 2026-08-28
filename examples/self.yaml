@@ -1,0 +1,28 @@
+# The deck this branch would hand you about itself. View from the repo root:
+#   cargo run -- examples/self.yaml
+title: "debrief v0: schema, diff engine, viewer"
+base: master
+steps:
+  - type: cover
+    what: "A deck an agent writes, a person reads in the terminal — one claim per screen"
+    bullets:
+      - "Slides hold no code; they point at file:line and the viewer draws the real hunk"
+      - "Length is refused by the schema, not requested politely"
+      - "Own diff parser and word-level emphasis; git is the only process spawned"
+  - type: map
+  - type: point
+    at: "src/deck.rs:17"
+    claim: "12 steps is a hard schema limit — the 40-slide picture-story death is fenced off here"
+  - type: point
+    at: "src/diff/git.rs:33"
+    claim: "base resolves through merge-base with HEAD, so a moved base branch never shows reversed"
+  - type: before_after
+    at: "src/diff/words.rs:70"
+    claim: "word emphasis backs off when lines share under a third of their tokens"
+  - type: zoom
+    at: "src/ui.rs:76"
+    claim: "the whole UI: n/p step, Enter dives into the full diff, q quits"
+  - type: risk
+    at: "tests/schema_golden.rs:23"
+    claim: "schema changes silently break every agent writing decks — the golden test makes drift a deliberate commit"
+    severity: medium

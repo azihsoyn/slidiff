@@ -84,5 +84,8 @@ fn cmd_view(path: &Path) -> Result<ExitCode> {
         }
         bail!("deck does not validate — fix it or run `debrief check`");
     }
-    bail!("viewer not built yet");
+    let cwd = std::env::current_dir().context("cannot read current dir")?;
+    let repo = debrief::diff::Repo::discover(&cwd)?;
+    debrief::ui::run(deck, repo)?;
+    Ok(ExitCode::SUCCESS)
 }

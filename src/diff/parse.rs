@@ -172,11 +172,10 @@ fn split_git_paths(s: &str) -> (String, String) {
         let n = rest.len().saturating_sub(3) / 2;
         if rest.len() == 2 * n + 3 && rest.is_char_boundary(n) {
             let (old, tail) = rest.split_at(n);
-            if let Some(new) = tail.strip_prefix(" b/") {
-                if old == new {
+            if let Some(new) = tail.strip_prefix(" b/")
+                && old == new {
                     return (old.to_string(), new.to_string());
                 }
-            }
         }
     }
     // Renames: split at the last " b/".

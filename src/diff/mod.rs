@@ -21,7 +21,7 @@ pub fn file_diff<'a>(files: &'a [FileDiff], file: &str) -> Option<&'a FileDiff> 
 
 /// The hunk whose new side contains `line`, or failing that the hunk
 /// nearest to it. `bool` is true when the hit is exact.
-pub fn hunk_at<'a>(fd: &'a FileDiff, line: u32) -> Option<(&'a Hunk, bool)> {
+pub fn hunk_at(fd: &FileDiff, line: u32) -> Option<(&Hunk, bool)> {
     let exact = fd
         .hunks
         .iter()

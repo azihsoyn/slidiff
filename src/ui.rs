@@ -2,33 +2,38 @@
 //! full diff behind the current step. Keys: n/p step, Enter dive/back,
 //! q quit.
 //!
-//! Slide anatomy: a one-line claim with an accent bar, then the excerpt —
-//! syntax-highlighted, context dimmed hard, notes hanging off their lines
-//! rustc-style. No line numbers on slides; those live in the dive.
+//! Slide anatomy: a rounded page frame, a one-line claim with an accent
+//! bar, then the excerpt — syntax highlighted, diff shown as background
+//! tint (added green, deleted red, changed words darker + bold), context
+//! dimmed, notes hanging off their lines rustc-style. No signs and no
+//! line numbers on slides; those live in the dive. A filmstrip along the
+//! bottom keeps the whole deck in view, and the status bar always says
+//! how much of the diff the deck has actually touched.
 
 use std::collections::HashMap;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::deck::{Anchor, Deck, Note, Severity, Step};
+use crate::deck::{Anchor, Deck, Group, Note, Severity, Step};
 use crate::diff::{
-    ExcerptRow, FileDiff, LineKind, Repo, Segment, emphasize_hunk, excerpt,
-    file_diff, load_diff,
+    ExcerptRow, FileDiff, LineKind, Repo, Segment, emphasize_hunk, excerpt, file_diff, load_diff,
 };
 use crate::highlight::{Lang, highlight};
 
 pub fn run(deck: Deck, repo: Repo) -> Result<()> {
     let files = load_diff(&repo, deck.base.as_deref())?;
+    let coverage = Coverage::compute(&deck, &files);
     let mut app = App {
         deck,
         repo,
         files,
+        coverage,
         step: 0,
         mode: Mode::Steps,
         file_cache: HashMap::new(),
@@ -48,12 +53,81 @@ struct App {
     deck: Deck,
     repo: Repo,
     files: Vec<FileDiff>,
+    coverage: Coverage,
     step: usize,
     mode: Mode,
     file_cache: HashMap<String, Option<Vec<String>>>,
 }
 
 const ACCENT: Color = Color::Cyan;
+const ADD_BG: Color = Color::Rgb(16, 56, 28);
+const ADD_EMPH_BG: Color = Color::Rgb(22, 92, 42);
+const DEL_BG: Color = Color::Rgb(68, 26, 26);
+const DEL_EMPH_BG: Color = Color::Rgb(112, 40, 40);
+
+/// How much of the diff the deck actually points at. Shown permanently:
+/// a ten-step tour of a ten-thousand-line change must say so itself.
+struct Coverage {
+    lines_touched: usize,
+    lines_total: usize,
+    files_touched: usize,
+    files_total: usize,
+    /// Biggest changed files no step points at: (basename, added lines).
+    untouched_top: Vec<(String, usize)>,
+}
+
+impl Coverage {
+    fn compute(deck: &Deck, files: &[FileDiff]) -> Coverage {
+        let mut ranges: HashMap<&str, Vec<(u32, u32)>> = HashMap::new();
+        for step in &deck.steps {
+            if let Some(at) = step.anchor() {
+                ranges.entry(at.file.as_str()).or_default().push(at.range());
+            }
+        }
+        let mut cov = Coverage {
+            lines_touched: 0,
+            lines_total: 0,
+            files_touched: 0,
+            files_total: files.len(),
+            untouched_top: Vec::new(),
+        };
+        let mut untouched: Vec<(String, usize)> = Vec::new();
+        for fd in files {
+            let added = fd.added();
+            cov.lines_total += added;
+            let file_ranges = ranges.get(fd.new_path.as_str());
+            let touched = match file_ranges {
+                None => 0,
+                Some(rs) => fd
+                    .hunks
+                    .iter()
+                    .flat_map(|h| &h.lines)
+                    .filter(|l| l.kind == LineKind::Add)
+                    .filter_map(|l| l.new_no)
+                    .filter(|no| rs.iter().any(|(lo, hi)| no >= lo && no <= hi))
+                    .count(),
+            };
+            cov.lines_touched += touched;
+            if file_ranges.is_some() {
+                cov.files_touched += 1;
+            } else if added > 0 {
+                let base = fd.new_path.rsplit('/').next().unwrap_or(&fd.new_path);
+                untouched.push((base.to_string(), added));
+            }
+        }
+        untouched.sort_by_key(|(_, added)| std::cmp::Reverse(*added));
+        untouched.truncate(3);
+        cov.untouched_top = untouched;
+        cov
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "covers +{}/+{} · {}/{} files",
+            self.lines_touched, self.lines_total, self.files_touched, self.files_total
+        )
+    }
+}
 
 impl App {
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -113,14 +187,36 @@ impl App {
     // ---- drawing ----------------------------------------------------
 
     fn draw(&mut self, frame: &mut Frame) {
-        let [body, status] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
         match self.mode {
             Mode::Steps => {
-                self.draw_step(frame, body);
+                let strip_h = if frame.area().height >= 14 { 3 } else { 0 };
+                let [main, strip, status] = Layout::vertical([
+                    Constraint::Min(1),
+                    Constraint::Length(strip_h),
+                    Constraint::Length(1),
+                ])
+                .areas(frame.area());
+                let page = page_rect(main);
+                frame.render_widget(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::new().dim()),
+                    page,
+                );
+                let inner = page.inner(Margin {
+                    horizontal: 3,
+                    vertical: 1,
+                });
+                self.draw_step(frame, inner);
+                if strip_h > 0 {
+                    self.draw_filmstrip(frame, strip);
+                }
                 self.draw_status(frame, status);
             }
             Mode::Dive { scroll } => {
+                let [body, status] =
+                    Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
+                        .areas(frame.area());
                 self.draw_dive(frame, body, scroll);
                 let hint = " dive · n/p scroll · enter back · q quit ";
                 frame.render_widget(
@@ -137,6 +233,7 @@ impl App {
         if let Some(at) = step.anchor() {
             left.push_str(&format!(" · {at}"));
         }
+        left.push_str(&format!(" · {}", self.coverage.summary()));
         let right = "n next · p prev · enter diff · q quit ";
         let [l, r] = Layout::horizontal([
             Constraint::Min(1),
@@ -145,6 +242,64 @@ impl App {
         .areas(area);
         frame.render_widget(Paragraph::new(left).style(Style::new().dim()), l);
         frame.render_widget(Paragraph::new(right).style(Style::new().dim()), r);
+    }
+
+    /// One little numbered box per step, current one lit. The outline the
+    /// reader keeps in the corner of their eye.
+    fn draw_filmstrip(&self, frame: &mut Frame, area: Rect) {
+        let n = self.deck.steps.len() as u16;
+        let box_w: u16 = 6;
+        let total = n * (box_w + 1) - 1;
+        if area.width >= total {
+            let x0 = area.x + (area.width - total) / 2;
+            for (i, step) in self.deck.steps.iter().enumerate() {
+                let rect = Rect {
+                    x: x0 + i as u16 * (box_w + 1),
+                    y: area.y,
+                    width: box_w,
+                    height: 3,
+                };
+                let current = i == self.step;
+                let style = if current {
+                    Style::new().fg(ACCENT).bold()
+                } else {
+                    Style::new().dim()
+                };
+                frame.render_widget(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(style),
+                    rect,
+                );
+                frame.render_widget(
+                    Paragraph::new(format!("{}{}", i + 1, step_glyph(step)))
+                        .centered()
+                        .style(style),
+                    rect.inner(Margin {
+                        horizontal: 1,
+                        vertical: 1,
+                    }),
+                );
+            }
+        } else {
+            let mut spans = Vec::new();
+            for (i, step) in self.deck.steps.iter().enumerate() {
+                let label = format!(" {}{} ", i + 1, step_glyph(step));
+                if i == self.step {
+                    spans.push(Span::styled(label, Style::new().fg(Color::Black).bg(ACCENT)));
+                } else {
+                    spans.push(Span::styled(label, Style::new().dim()));
+                }
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).centered(),
+                Rect {
+                    y: area.y + area.height / 2,
+                    height: 1,
+                    ..area
+                },
+            );
+        }
     }
 
     fn draw_step(&mut self, frame: &mut Frame, area: Rect) {
@@ -182,7 +337,7 @@ impl App {
             }
         }
         let height = (lines.len() as u16 + 2).min(area.height);
-        let block = centered(area, 76.min(area.width.saturating_sub(4)), height);
+        let block = centered(area, 76.min(area.width.saturating_sub(2)), height);
         frame.render_widget(
             Paragraph::new(lines).wrap(Wrap { trim: false }).centered(),
             block,
@@ -208,7 +363,7 @@ impl App {
         }
         let lang = Lang::from_path(&at.file);
         let mut lines = vec![file_header(&at.file)];
-        lines.extend(excerpt_lines(&rows, lang, notes, at.focus()));
+        lines.extend(excerpt_lines(&rows, lang, notes, body.width));
         frame.render_widget(Paragraph::new(lines), body);
     }
 
@@ -244,19 +399,23 @@ impl App {
             .filter(|r| r.kind != LineKind::Del)
             .cloned()
             .collect();
-        let [l, r] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(body);
-        let side = |title: &str, rows: &[ExcerptRow]| {
-            let mut lines = vec![Line::from(title.to_string()).style(Style::new().bold().dim())];
-            lines.extend(excerpt_lines(rows, lang, &[], 0));
+        let [l, gap, r] = Layout::horizontal([
+            Constraint::Percentage(50),
+            Constraint::Length(2),
+            Constraint::Percentage(50),
+        ])
+        .areas(body);
+        let _ = gap;
+        let side = |title: String, rows: &[ExcerptRow], width: u16| {
+            let mut lines = vec![Line::from(title).style(Style::new().bold().dim())];
+            lines.extend(excerpt_lines(rows, lang, &[], width));
             Paragraph::new(lines)
         };
-        frame.render_widget(side(&format!("── before · {}", at.file), &before), l);
-        frame.render_widget(side("── after", &after), r);
+        frame.render_widget(side(format!("── before · {}", at.file), &before, l.width), l);
+        frame.render_widget(side("── after".to_string(), &after, r.width), r);
     }
 
-    fn draw_map(&mut self, frame: &mut Frame, area: Rect, groups: &[crate::deck::Group]) {
+    fn draw_map(&mut self, frame: &mut Frame, area: Rect, groups: &[Group]) {
         struct RowData {
             label: String,
             files: usize,
@@ -302,7 +461,7 @@ impl App {
             .collect();
         if !rest.is_empty() {
             rows.push(RowData {
-                label: "その他".to_string(),
+                label: "other".to_string(),
                 files: rest.len(),
                 added: rest.iter().map(|f| f.added()).sum(),
                 deleted: rest.iter().map(|f| f.deleted()).sum(),
@@ -319,6 +478,7 @@ impl App {
 
         let mut lines = vec![
             Line::from(self.deck.title.clone().bold().fg(ACCENT)),
+            Line::from(self.coverage.summary().dim()),
             Line::default(),
         ];
         for row in &rows {
@@ -342,7 +502,22 @@ impl App {
                 Span::styled("▇".repeat(bar_len), dim_if_rest(Style::new().fg(ACCENT))),
             ]));
         }
-        let width = (label_width + 42).min(area.width as usize) as u16;
+        if !self.coverage.untouched_top.is_empty() {
+            lines.push(Line::default());
+            let mut spans = vec![Span::styled("no step points at: ", Style::new().red().dim())];
+            for (i, (name, added)) in self.coverage.untouched_top.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(" · ", Style::new().dim()));
+                }
+                spans.push(Span::styled(
+                    format!("{name} +{added}"),
+                    Style::new().dim(),
+                ));
+            }
+            spans.push(Span::styled(" …", Style::new().dim()));
+            lines.push(Line::from(spans));
+        }
+        let width = (label_width + 44).min(area.width as usize) as u16;
         let height = (lines.len() as u16).min(area.height);
         frame.render_widget(Paragraph::new(lines), centered(area, width, height));
     }
@@ -381,7 +556,6 @@ impl App {
                     );
                     let mut spans = vec![Span::styled(no, Style::new().dim())];
                     spans.extend(code_spans(lang, &line.text, line.kind, Some(&seg)));
-                    spans.insert(1, sign_span(line.kind));
                     let mut out = Line::from(spans);
                     if let Some(t) = &target
                         && line.new_no == Some(t.focus()) {
@@ -398,6 +572,16 @@ impl App {
 }
 
 // ---- shared rendering helpers ---------------------------------------
+
+fn step_glyph(step: &Step) -> &'static str {
+    match step {
+        Step::Cover { .. } => "◇",
+        Step::Map { .. } => "▦",
+        Step::Point { .. } => "●",
+        Step::BeforeAfter { .. } => "◐",
+        Step::Risk { .. } => "▲",
+    }
+}
 
 /// The claim: an accent bar, bold text, no box. Returns the body area.
 fn draw_claim(
@@ -458,18 +642,30 @@ fn file_header<'a>(path: &str) -> Line<'a> {
     Line::from(format!("── {path}")).style(Style::new().dim())
 }
 
-/// Excerpt rows as slide lines: sign column, syntax colors, context dimmed,
-/// notes hanging under their lines.
+/// Excerpt rows as slide lines: no signs, no numbers — added and deleted
+/// lines carry a background tint the full width of the slide instead.
+/// Notes hang under their lines.
 fn excerpt_lines<'a>(
     rows: &[ExcerptRow],
     lang: Lang,
     notes: &[Note],
-    _focus: u32,
+    width: u16,
 ) -> Vec<Line<'a>> {
     let mut out = Vec::new();
     for row in rows {
-        let mut spans = vec![sign_span(row.kind)];
-        spans.extend(code_spans(lang, &row.text, row.kind, row.segments.as_deref()));
+        let mut spans = code_spans(lang, &row.text, row.kind, row.segments.as_deref());
+        // Extend the tint across the slide so a changed line reads as a band.
+        if row.kind != LineKind::Context {
+            let used = display_width(&row.text);
+            let target = width as usize;
+            if used < target {
+                let bg = if row.kind == LineKind::Add { ADD_BG } else { DEL_BG };
+                spans.push(Span::styled(
+                    " ".repeat(target - used),
+                    Style::new().bg(bg),
+                ));
+            }
+        }
         out.push(Line::from(spans));
         if let Some(no) = row.new_no {
             for note in notes.iter().filter(|n| n.line == no) {
@@ -479,7 +675,6 @@ fn excerpt_lines<'a>(
                     .take_while(|c| c.is_whitespace())
                     .collect();
                 out.push(Line::from(vec![
-                    Span::raw("  "),
                     Span::raw(indent),
                     Span::styled("└ ", Style::new().fg(ACCENT)),
                     Span::styled(note.text.clone(), Style::new().fg(ACCENT).bold()),
@@ -490,49 +685,46 @@ fn excerpt_lines<'a>(
     out
 }
 
-fn sign_span<'a>(kind: LineKind) -> Span<'a> {
-    match kind {
-        LineKind::Context => Span::raw("  "),
-        LineKind::Add => Span::styled("+ ", Style::new().green().bold()),
-        LineKind::Del => Span::styled("- ", Style::new().red().dim()),
-    }
-}
-
 /// Syntax-highlighted spans for one code line, adjusted by its diff role:
-/// context sinks (DIM), deletions go quiet red, additions keep full syntax
-/// color with changed words bold-underlined.
+/// context sinks (DIM), additions sit on a green tint, deletions on a red
+/// tint, and changed words in a del/add pair get a stronger tint + bold.
+/// A line that is entirely new (no partner) is a plain add — emphasizing
+/// all of it would just be noise.
 fn code_spans<'a>(
     lang: Lang,
     text: &str,
     kind: LineKind,
     segments: Option<&[Segment]>,
 ) -> Vec<Span<'a>> {
+    let runs = highlight(lang, text);
     match kind {
-        LineKind::Del => {
-            let base = Style::new().fg(Color::Red).add_modifier(Modifier::DIM);
-            let emph = Style::new().fg(Color::Red);
-            match segments {
-                Some(segs) => segs
-                    .iter()
-                    .map(|s| Span::styled(s.text.clone(), if s.emph { emph } else { base }))
-                    .collect(),
-                None => vec![Span::styled(text.to_string(), base)],
-            }
-        }
-        LineKind::Context => highlight(lang, text)
+        LineKind::Context => runs
             .into_iter()
             .map(|run| Span::styled(run.text, run.style.add_modifier(Modifier::DIM)))
             .collect(),
-        LineKind::Add => {
-            let runs = highlight(lang, text);
-            let Some(segs) = segments else {
+        LineKind::Add | LineKind::Del => {
+            let (bg, emph_bg) = if kind == LineKind::Add {
+                (ADD_BG, ADD_EMPH_BG)
+            } else {
+                (DEL_BG, DEL_EMPH_BG)
+            };
+            let paired = segments
+                .filter(|segs| !segs.iter().all(|s| s.emph))
+                .filter(|segs| segs.iter().any(|s| s.emph));
+            let Some(segs) = paired else {
                 return runs
                     .into_iter()
-                    .map(|run| Span::styled(run.text, run.style))
+                    .map(|run| {
+                        let mut style = run.style.bg(bg);
+                        if kind == LineKind::Del {
+                            style = style.add_modifier(Modifier::DIM);
+                        }
+                        Span::styled(run.text, style)
+                    })
                     .collect();
             };
             // Overlay word emphasis on the syntax runs: mark each char,
-            // then rebuild runs with BOLD+UNDERLINED where emphasized.
+            // then rebuild runs with the stronger tint where emphasized.
             let mut emph_flags = Vec::with_capacity(text.chars().count());
             for seg in segs {
                 emph_flags.extend(std::iter::repeat_n(seg.emph, seg.text.chars().count()));
@@ -549,13 +741,13 @@ fn code_spans<'a>(
                         cur_emph = Some(e);
                         cur.push(c);
                     } else {
-                        spans.push(emph_span(cur, run.style, cur_emph.unwrap_or(false)));
+                        spans.push(tint_span(cur, run.style, cur_emph.unwrap_or(false), bg, emph_bg));
                         cur = c.to_string();
                         cur_emph = Some(e);
                     }
                 }
                 if !cur.is_empty() {
-                    spans.push(emph_span(cur, run.style, cur_emph.unwrap_or(false)));
+                    spans.push(tint_span(cur, run.style, cur_emph.unwrap_or(false), bg, emph_bg));
                 }
             }
             spans
@@ -563,14 +755,11 @@ fn code_spans<'a>(
     }
 }
 
-fn emph_span<'a>(text: String, base: Style, emph: bool) -> Span<'a> {
+fn tint_span<'a>(text: String, base: Style, emph: bool, bg: Color, emph_bg: Color) -> Span<'a> {
     if emph {
-        Span::styled(
-            text,
-            base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )
+        Span::styled(text, base.bg(emph_bg).add_modifier(Modifier::BOLD))
     } else {
-        Span::styled(text, base)
+        Span::styled(text, base.bg(bg))
     }
 }
 
@@ -579,6 +768,18 @@ fn display_width(s: &str) -> usize {
     s.chars()
         .map(|c| if (c as u32) > 0x1100 { 2 } else { 1 })
         .sum()
+}
+
+/// The page the slide is drawn on: centered, capped width, full height.
+fn page_rect(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(4).clamp(20, 110);
+    let [_, mid, _] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(width),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    mid
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -612,7 +813,6 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::deck::Group;
     use crate::diff::parse_unified;
 
     const SAMPLE: &str = "\
@@ -628,16 +828,20 @@ diff --git a/src/lib.rs b/src/lib.rs
 ";
 
     fn app_with(steps: Vec<Step>) -> App {
+        let files = parse_unified(SAMPLE);
+        let deck = Deck {
+            title: "Test deck".into(),
+            base: None,
+            steps,
+        };
+        let coverage = Coverage::compute(&deck, &files);
         App {
-            deck: Deck {
-                title: "Test deck".into(),
-                base: None,
-                steps,
-            },
+            deck,
             repo: Repo {
                 root: PathBuf::from("/nonexistent"),
             },
-            files: parse_unified(SAMPLE),
+            files,
+            coverage,
             step: 0,
             mode: Mode::Steps,
             file_cache: HashMap::new(),
@@ -645,7 +849,7 @@ diff --git a/src/lib.rs b/src/lib.rs
     }
 
     fn screen(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
@@ -659,7 +863,7 @@ diff --git a/src/lib.rs b/src/lib.rs
     }
 
     #[test]
-    fn point_shows_claim_excerpt_and_note() {
+    fn point_shows_claim_excerpt_note_and_chrome() {
         let mut app = app_with(vec![Step::Point {
             at: "src/lib.rs:10-13".parse().unwrap(),
             claim: "take() returns the value".into(),
@@ -674,9 +878,48 @@ diff --git a/src/lib.rs b/src/lib.rs
         assert!(s.contains("self.map.take(&id);"), "add line missing:\n{s}");
         assert!(s.contains("self.map.remove(&id);"), "del line missing:\n{s}");
         assert!(s.contains("└ caller now owns it"), "note missing:\n{s}");
-        assert!(s.contains("1/1 · point · src/lib.rs:10-13"), "status missing:\n{s}");
-        // No line-number gutter on slides.
-        assert!(!s.contains(" 10 "), "line numbers should not appear:\n{s}");
+        assert!(s.contains("╭"), "page frame missing:\n{s}");
+        assert!(s.contains("1●"), "filmstrip missing:\n{s}");
+        assert!(s.contains("covers +1/+1"), "coverage missing:\n{s}");
+        // No sign column, no line numbers on slides.
+        assert!(!s.contains("+ self.map"), "sign column should be gone:\n{s}");
+    }
+
+    #[test]
+    fn unpaired_add_gets_no_word_emphasis() {
+        let text = "\
+diff --git a/f.rs b/f.rs
+--- a/f.rs
++++ b/f.rs
+@@ -1,2 +1,3 @@
+ ctx
++let brand_new = 1;
+ tail
+";
+        let hunk = &parse_unified(text)[0].hunks[0];
+        let segs = emphasize_hunk(hunk);
+        let spans = code_spans(Lang::Rust, "let brand_new = 1;", LineKind::Add, Some(&segs[1]));
+        assert!(
+            spans.iter().all(|sp| !sp.style.add_modifier.contains(Modifier::BOLD)
+                && sp.style.bg == Some(ADD_BG)),
+            "whole-line adds must stay plain: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn paired_change_gets_stronger_tint_on_changed_word() {
+        let files = parse_unified(SAMPLE);
+        let hunk = &files[0].hunks[0];
+        let segs = emphasize_hunk(hunk);
+        let spans = code_spans(Lang::Rust, &hunk.lines[2].text, LineKind::Add, Some(&segs[2]));
+        assert!(
+            spans.iter().any(|sp| sp.style.bg == Some(ADD_EMPH_BG)),
+            "changed word should get emphasis tint: {spans:?}"
+        );
+        assert!(
+            spans.iter().all(|sp| !sp.style.add_modifier.contains(Modifier::UNDERLINED)),
+            "no underline anywhere: {spans:?}"
+        );
     }
 
     #[test]
@@ -691,6 +934,21 @@ diff --git a/src/lib.rs b/src/lib.rs
     }
 
     #[test]
+    fn map_aggregates_groups_and_reports_coverage() {
+        let mut app = app_with(vec![Step::Map {
+            groups: vec![Group {
+                label: "core".into(),
+                files: vec!["src/".into()],
+            }],
+        }]);
+        let s = screen(&mut app);
+        assert!(s.contains("core"), "{s}");
+        assert!(s.contains("1 file"), "{s}");
+        assert!(s.contains("covers +0/+1"), "{s}");
+        assert!(s.contains("no step points at: lib.rs +1"), "{s}");
+    }
+
+    #[test]
     fn before_after_splits_old_and_new() {
         let mut app = app_with(vec![Step::BeforeAfter {
             at: "src/lib.rs:11".parse().unwrap(),
@@ -701,22 +959,6 @@ diff --git a/src/lib.rs b/src/lib.rs
         assert!(s.contains("── after"), "{s}");
         assert!(s.contains("remove"), "{s}");
         assert!(s.contains("take"), "{s}");
-    }
-
-    #[test]
-    fn map_aggregates_groups_and_rest() {
-        let mut app = app_with(vec![Step::Map {
-            groups: vec![Group {
-                label: "core".into(),
-                files: vec!["src/".into()],
-            }],
-        }]);
-        let s = screen(&mut app);
-        assert!(s.contains("core"), "{s}");
-        assert!(s.contains("1 file"), "{s}");
-        assert!(s.contains("+1"), "{s}");
-        assert!(s.contains("-1"), "{s}");
-        assert!(!s.contains("その他"), "no rest row expected:\n{s}");
     }
 
     #[test]

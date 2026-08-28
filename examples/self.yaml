@@ -1,28 +1,48 @@
 # The deck this branch would hand you about itself. View from the repo root:
 #   cargo run -- examples/self.yaml
-title: "debrief v0: schema, diff engine, viewer"
+title: "debrief v0.2: 切り出しと注釈をスキーマで強制する"
 base: master
 steps:
   - type: cover
-    what: "A deck an agent writes, a person reads in the terminal — one claim per screen"
+    what: "agent が書き、人が端末で読む報告 deck。1 画面 1 主張"
     bullets:
-      - "Slides hold no code; they point at file:line and the viewer draws the real hunk"
-      - "Length is refused by the schema, not requested politely"
-      - "Own diff parser and word-level emphasis; git is the only process spawned"
+      - "スライドはコードを持たず file:行範囲 で指すだけ"
+      - "文量も切り出し幅もスキーマが拒否する"
+      - "描画は表示時に repo から。写しは古びない"
   - type: map
+    groups:
+      - label: "スキーマ"
+        files: ["src/deck.rs", "schema/debrief.schema.json"]
+      - label: "diff エンジン"
+        files: ["src/diff/"]
+      - label: "描画"
+        files: ["src/ui.rs", "src/highlight.rs"]
+      - label: "テスト"
+        files: ["tests/"]
   - type: point
-    at: "src/deck.rs:17"
-    claim: "12 steps is a hard schema limit — the 40-slide picture-story death is fenced off here"
+    at: "src/deck.rs:19-32"
+    claim: "限界値は頼まず、形式が拒否する"
+    notes:
+      - line: 21
+        text: "claim は 1 行分だけ"
+      - line: 32
+        text: "ブロック丸ごとの切り出しは通らない"
   - type: point
-    at: "src/diff/git.rs:33"
-    claim: "base resolves through merge-base with HEAD, so a moved base branch never shows reversed"
+    at: "src/deck.rs:302-310"
+    claim: "validation エラーは書き直しの指示文になっている"
+    notes:
+      - line: 306
+        text: "「意味のある行に絞れ」と言い返す"
+  - type: point
+    at: "src/diff/git.rs:29-38"
+    claim: "base は merge-base 経由。先行した base の逆差分は出ない"
   - type: before_after
-    at: "src/diff/words.rs:70"
-    claim: "word emphasis backs off when lines share under a third of their tokens"
-  - type: zoom
-    at: "src/ui.rs:76"
-    claim: "the whole UI: n/p step, Enter dives into the full diff, q quits"
+    at: "src/diff/excerpt.rs:24-33"
+    claim: "切り出しは diff とファイルの継ぎ接ぎで組む"
   - type: risk
-    at: "tests/schema_golden.rs:23"
-    claim: "schema changes silently break every agent writing decks — the golden test makes drift a deliberate commit"
+    at: "tests/schema_golden.rs:20-25"
+    claim: "スキーマの黙った変更は deck を書く全 agent を壊す"
     severity: medium
+    notes:
+      - line: 23
+        text: "golden test がドリフトを意図的コミットに変える"

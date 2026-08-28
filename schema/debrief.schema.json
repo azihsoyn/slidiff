@@ -1,9 +1,53 @@
 {
   "$defs": {
-    "Location": {
-      "description": "A place in the repository, written file:line (line on the new side of the diff), e.g. \"src/main.rs:42\".",
-      "pattern": "^.+:[1-9][0-9]*$",
+    "Anchor": {
+      "description": "An excerpt in the repository: \"src/main.rs:42\" (one line plus context) or \"src/main.rs:42-57\" (explicit range, at most 16 lines). Lines are on the new side of the diff.",
+      "pattern": "^.+:[1-9][0-9]*(-[1-9][0-9]*)?$",
       "type": "string"
+    },
+    "Group": {
+      "additionalProperties": false,
+      "description": "A named group of files for the map step.",
+      "properties": {
+        "files": {
+          "description": "Repo-relative paths, as they appear in the diff.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "label": {
+          "maxLength": 24,
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "files"
+      ],
+      "type": "object"
+    },
+    "Note": {
+      "additionalProperties": false,
+      "description": "One line of explanation attached to one line of code.",
+      "properties": {
+        "line": {
+          "description": "Line number (new side) the note hangs off. Must fall inside the\nstep's range.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "maxLength": 48,
+          "type": "string"
+        }
+      },
+      "required": [
+        "line",
+        "text"
+      ],
+      "type": "object"
     },
     "Severity": {
       "enum": [
@@ -21,7 +65,7 @@
             "bullets": {
               "description": "Up to three supporting lines.",
               "items": {
-                "maxLength": 120,
+                "maxLength": 60,
                 "type": "string"
               },
               "maxItems": 3,
@@ -33,7 +77,7 @@
             },
             "what": {
               "description": "One line stating what was done.",
-              "maxLength": 120,
+              "maxLength": 80,
               "type": "string"
             }
           },
@@ -44,14 +88,21 @@
           "type": "object"
         },
         {
-          "description": "One claim about one place. The viewer shows the hunk at `at`.",
+          "description": "One claim about one excerpt. The viewer shows the chosen lines —\ndiff-aware when they changed, plain code when they did not — with\nnotes hanging off individual lines.",
           "properties": {
             "at": {
-              "$ref": "#/$defs/Location"
+              "$ref": "#/$defs/Anchor"
             },
             "claim": {
-              "maxLength": 120,
+              "maxLength": 80,
               "type": "string"
+            },
+            "notes": {
+              "items": {
+                "$ref": "#/$defs/Note"
+              },
+              "maxItems": 3,
+              "type": "array"
             },
             "type": {
               "const": "point",
@@ -66,13 +117,13 @@
           "type": "object"
         },
         {
-          "description": "Old and new side by side for the hunk at `at`.",
+          "description": "Old and new side by side for the excerpt at `at`.",
           "properties": {
             "at": {
-              "$ref": "#/$defs/Location"
+              "$ref": "#/$defs/Anchor"
             },
             "claim": {
-              "maxLength": 120,
+              "maxLength": 80,
               "type": [
                 "string",
                 "null"
@@ -90,38 +141,21 @@
           "type": "object"
         },
         {
-          "description": "The file as it is now, centered on `at` — for reading context,\nnot the change itself.",
+          "description": "A point that could go wrong, with a severity.",
           "properties": {
             "at": {
-              "$ref": "#/$defs/Location"
+              "$ref": "#/$defs/Anchor"
             },
             "claim": {
-              "maxLength": 120,
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "type": {
-              "const": "zoom",
+              "maxLength": 80,
               "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "at"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Something that could go wrong, anchored to where it lives.",
-          "properties": {
-            "at": {
-              "$ref": "#/$defs/Location"
             },
-            "claim": {
-              "maxLength": 120,
-              "type": "string"
+            "notes": {
+              "items": {
+                "$ref": "#/$defs/Note"
+              },
+              "maxItems": 3,
+              "type": "array"
             },
             "severity": {
               "$ref": "#/$defs/Severity"
@@ -140,15 +174,24 @@
           "type": "object"
         },
         {
-          "description": "Overview of every file the diff touches. Drawn from the repo;\ncarries no content of its own.",
+          "description": "The touched files, summarized by the writer into named groups.\nFiles not covered by any group aggregate into an automatic rest row.\nCounts are drawn from the repo at display time.",
           "properties": {
+            "groups": {
+              "items": {
+                "$ref": "#/$defs/Group"
+              },
+              "maxItems": 6,
+              "minItems": 1,
+              "type": "array"
+            },
             "type": {
               "const": "map",
               "type": "string"
             }
           },
           "required": [
-            "type"
+            "type",
+            "groups"
           ],
           "type": "object"
         }
@@ -176,7 +219,7 @@
     },
     "title": {
       "description": "One line naming what this deck reports on.",
-      "maxLength": 120,
+      "maxLength": 80,
       "type": "string"
     }
   },

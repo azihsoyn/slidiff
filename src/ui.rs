@@ -1,22 +1,27 @@
 //! The viewer. Two modes only: one step per screen, and a dive into the
 //! full diff behind the current step. Keys: n/p step, Enter dive/back,
 //! q quit.
+//!
+//! Slide anatomy: a one-line claim with an accent bar, then the excerpt —
+//! syntax-highlighted, context dimmed hard, notes hanging off their lines
+//! rustc-style. No line numbers on slides; those live in the dive.
 
 use std::collections::HashMap;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::deck::{Deck, Location, Severity, Step};
+use crate::deck::{Anchor, Deck, Note, Severity, Step};
 use crate::diff::{
-    FileDiff, FileStatus, Hunk, LineKind, Repo, Segment, emphasize_hunk, file_diff, hunk_at,
-    load_diff,
+    ExcerptRow, FileDiff, LineKind, Repo, Segment, emphasize_hunk, excerpt,
+    file_diff, load_diff,
 };
+use crate::highlight::{Lang, highlight};
 
 pub fn run(deck: Deck, repo: Repo) -> Result<()> {
     let files = load_diff(&repo, deck.base.as_deref())?;
@@ -47,6 +52,8 @@ struct App {
     mode: Mode,
     file_cache: HashMap<String, Option<Vec<String>>>,
 }
+
+const ACCENT: Color = Color::Cyan;
 
 impl App {
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -127,7 +134,7 @@ impl App {
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
         let step = self.current();
         let mut left = format!(" {}/{} · {}", self.step + 1, self.deck.steps.len(), step.type_name());
-        if let Some(at) = step.location() {
+        if let Some(at) = step.anchor() {
             left.push_str(&format!(" · {at}"));
         }
         let right = "n next · p prev · enter diff · q quit ";
@@ -143,228 +150,205 @@ impl App {
     fn draw_step(&mut self, frame: &mut Frame, area: Rect) {
         match self.current().clone() {
             Step::Cover { what, bullets } => self.draw_cover(frame, area, &what, &bullets),
-            Step::Point { at, claim } => {
-                self.draw_claim_and_hunk(frame, area, &at, Some(&claim), None)
+            Step::Point { at, claim, notes } => {
+                self.draw_excerpt_slide(frame, area, &at, Some(&claim), &notes, None)
             }
-            Step::Risk { at, claim, severity } => {
-                self.draw_claim_and_hunk(frame, area, &at, Some(&claim), Some(severity))
-            }
+            Step::Risk {
+                at,
+                claim,
+                severity,
+                notes,
+            } => self.draw_excerpt_slide(frame, area, &at, Some(&claim), &notes, Some(severity)),
             Step::BeforeAfter { at, claim } => {
                 self.draw_before_after(frame, area, &at, claim.as_deref())
             }
-            Step::Zoom { at, claim } => self.draw_zoom(frame, area, &at, claim.as_deref()),
-            Step::Map => self.draw_map(frame, area),
+            Step::Map { groups } => self.draw_map(frame, area, &groups),
         }
     }
 
     fn draw_cover(&self, frame: &mut Frame, area: Rect, what: &str, bullets: &[String]) {
         let mut lines = vec![
-            Line::from(self.deck.title.clone().bold().cyan()),
+            Line::from(self.deck.title.clone().bold().fg(ACCENT)),
             Line::default(),
-            Line::from(what.to_string()),
+            Line::from(what.to_string().bold()),
         ];
         if !bullets.is_empty() {
             lines.push(Line::default());
             for b in bullets {
-                lines.push(Line::from(format!("• {b}")));
+                lines.push(Line::from(vec![
+                    Span::styled("• ", Style::new().fg(ACCENT)),
+                    Span::raw(b.clone()),
+                ]));
             }
         }
         let height = (lines.len() as u16 + 2).min(area.height);
-        let block = centered(area, 72.min(area.width.saturating_sub(4)), height);
-        frame.render_widget(Clear, block);
+        let block = centered(area, 76.min(area.width.saturating_sub(4)), height);
         frame.render_widget(
             Paragraph::new(lines).wrap(Wrap { trim: false }).centered(),
             block,
         );
     }
 
-    /// point and risk: claim on top, the hunk at `at` below.
-    fn draw_claim_and_hunk(
+    /// point and risk: claim with an accent bar, then the excerpt with
+    /// notes hanging off their lines.
+    fn draw_excerpt_slide(
         &mut self,
         frame: &mut Frame,
         area: Rect,
-        at: &Location,
+        at: &Anchor,
         claim: Option<&str>,
+        notes: &[Note],
         severity: Option<Severity>,
     ) {
         let body = draw_claim(frame, area, claim, severity);
-        let Some(fd) = file_diff(&self.files, &at.file) else {
-            self.draw_zoom_body(frame, body, at, "not in this diff — showing the file");
-            return;
-        };
-        if fd.binary {
-            render_note(frame, body, "binary file");
+        let rows = self.rows_for(at);
+        if rows.is_empty() {
+            render_note(frame, body, &format!("cannot read {}", at.file));
             return;
         }
-        let Some((hunk, exact)) = hunk_at(fd, at.line) else {
-            render_note(frame, body, "file has no hunks");
-            return;
-        };
-        let mut lines = vec![hunk_header(fd, hunk)];
-        if !exact {
-            lines.push(
-                Line::from(format!("(line {} is outside every hunk — nearest shown)", at.line))
-                    .style(Style::new().yellow().italic()),
-            );
-        }
-        lines.extend(hunk_lines(hunk, Some(at.line)));
-        let scroll = scroll_to(&lines, body.height, |l| {
-            line_is_target(hunk, at.line, l)
-        });
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
+        let lang = Lang::from_path(&at.file);
+        let mut lines = vec![file_header(&at.file)];
+        lines.extend(excerpt_lines(&rows, lang, notes, at.focus()));
+        frame.render_widget(Paragraph::new(lines), body);
+    }
+
+    fn rows_for(&mut self, at: &Anchor) -> Vec<ExcerptRow> {
+        let (start, end) = at.range();
+        // Read the file first so the &mut borrow ends before we borrow the diff.
+        let lines = self.file_lines(&at.file).map(|l| l.to_vec());
+        let fd = file_diff(&self.files, &at.file);
+        excerpt(fd, lines.as_deref(), start, end)
     }
 
     fn draw_before_after(
         &mut self,
         frame: &mut Frame,
         area: Rect,
-        at: &Location,
+        at: &Anchor,
         claim: Option<&str>,
     ) {
         let body = draw_claim(frame, area, claim, None);
-        let Some(fd) = file_diff(&self.files, &at.file) else {
-            self.draw_zoom_body(frame, body, at, "not in this diff — showing the file");
+        let rows = self.rows_for(at);
+        if rows.is_empty() {
+            render_note(frame, body, &format!("cannot read {}", at.file));
             return;
-        };
-        let Some((hunk, _)) = hunk_at(fd, at.line) else {
-            render_note(frame, body, "file has no hunks");
-            return;
-        };
-        let segs = emphasize_hunk(hunk);
-        let mut before: Vec<Line> = Vec::new();
-        let mut after: Vec<Line> = Vec::new();
-        for (line, seg) in hunk.lines.iter().zip(&segs) {
-            match line.kind {
-                LineKind::Context => {
-                    before.push(side_line(line.old_no, seg, Style::new()));
-                    after.push(side_line(line.new_no, seg, Style::new()));
-                }
-                LineKind::Del => before.push(side_line(line.old_no, seg, Style::new().red())),
-                LineKind::Add => after.push(side_line(line.new_no, seg, Style::new().green())),
-            }
         }
-        let [l, r] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .areas(body);
-        let title_style = Style::new().dim();
-        frame.render_widget(
-            Paragraph::new(before).block(
-                Block::new()
-                    .borders(Borders::TOP | Borders::RIGHT)
-                    .title(Span::styled(" before ", title_style)),
-            ),
-            l,
-        );
-        frame.render_widget(
-            Paragraph::new(after).block(
-                Block::new()
-                    .borders(Borders::TOP)
-                    .title(Span::styled(" after ", title_style)),
-            ),
-            r,
-        );
-    }
-
-    fn draw_zoom(&mut self, frame: &mut Frame, area: Rect, at: &Location, claim: Option<&str>) {
-        let body = draw_claim(frame, area, claim, None);
-        self.draw_zoom_body(frame, body, at, "");
-    }
-
-    fn draw_zoom_body(&mut self, frame: &mut Frame, area: Rect, at: &Location, note: &str) {
-        let added: Vec<u32> = file_diff(&self.files, &at.file)
-            .map(|fd| {
-                fd.hunks
-                    .iter()
-                    .flat_map(|h| &h.lines)
-                    .filter(|l| l.kind == LineKind::Add)
-                    .filter_map(|l| l.new_no)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let Some(lines) = self.file_lines(&at.file) else {
-            render_note(frame, area, &format!("cannot read {}", at.file));
-            return;
-        };
-        let total = lines.len() as u32;
-        let height = area.height.saturating_sub(1).max(1) as u32;
-        let target = at.line.min(total.max(1));
-        let start = target.saturating_sub(height / 2).max(1);
-        let mut out = vec![
-            Line::from(format!("── {} {}", at.file, note))
-                .style(Style::new().bold().dim()),
-        ];
-        for no in start..(start + height).min(total + 1) {
-            let text = &lines[(no - 1) as usize];
-            let changed = added.binary_search(&no).is_ok();
-            let gutter = Span::styled(
-                format!("{no:>5}{} ", if changed { "+" } else { " " }),
-                if changed {
-                    Style::new().green()
-                } else {
-                    Style::new().dim()
-                },
-            );
-            let mut line = Line::from(vec![gutter, Span::raw(text.clone())]);
-            if no == at.line {
-                line = line.style(Style::new().bg(Color::DarkGray));
-            }
-            out.push(line);
-        }
-        frame.render_widget(Paragraph::new(out), area);
-    }
-
-    fn draw_map(&mut self, frame: &mut Frame, area: Rect) {
-        let pointed: Vec<&str> = self
-            .deck
-            .steps
+        let lang = Lang::from_path(&at.file);
+        let before: Vec<ExcerptRow> = rows
             .iter()
-            .filter_map(|s| s.location())
-            .map(|at| at.file.as_str())
+            .filter(|r| r.kind != LineKind::Add)
+            .cloned()
             .collect();
+        let after: Vec<ExcerptRow> = rows
+            .iter()
+            .filter(|r| r.kind != LineKind::Del)
+            .cloned()
+            .collect();
+        let [l, r] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(body);
+        let side = |title: &str, rows: &[ExcerptRow]| {
+            let mut lines = vec![Line::from(title.to_string()).style(Style::new().bold().dim())];
+            lines.extend(excerpt_lines(rows, lang, &[], 0));
+            Paragraph::new(lines)
+        };
+        frame.render_widget(side(&format!("── before · {}", at.file), &before), l);
+        frame.render_widget(side("── after", &after), r);
+    }
+
+    fn draw_map(&mut self, frame: &mut Frame, area: Rect, groups: &[crate::deck::Group]) {
+        struct RowData {
+            label: String,
+            files: usize,
+            added: usize,
+            deleted: usize,
+            rest: bool,
+        }
+        let mut rows: Vec<RowData> = Vec::new();
+        let mut claimed = vec![false; self.files.len()];
+        for g in groups {
+            let mut files = 0;
+            let mut added = 0;
+            let mut deleted = 0;
+            for (i, fd) in self.files.iter().enumerate() {
+                let hit = g.files.iter().any(|entry| {
+                    if let Some(dir) = entry.strip_suffix('/') {
+                        fd.new_path.starts_with(dir)
+                    } else {
+                        fd.new_path == *entry
+                    }
+                });
+                if hit {
+                    claimed[i] = true;
+                    files += 1;
+                    added += fd.added();
+                    deleted += fd.deleted();
+                }
+            }
+            rows.push(RowData {
+                label: g.label.clone(),
+                files,
+                added,
+                deleted,
+                rest: false,
+            });
+        }
+        let rest: Vec<&FileDiff> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !claimed[*i])
+            .map(|(_, f)| f)
+            .collect();
+        if !rest.is_empty() {
+            rows.push(RowData {
+                label: "その他".to_string(),
+                files: rest.len(),
+                added: rest.iter().map(|f| f.added()).sum(),
+                deleted: rest.iter().map(|f| f.deleted()).sum(),
+                rest: true,
+            });
+        }
+
+        let label_width = rows
+            .iter()
+            .map(|r| display_width(&r.label))
+            .max()
+            .unwrap_or(4);
+        let max_delta = rows.iter().map(|r| r.added + r.deleted).max().unwrap_or(1).max(1);
+
         let mut lines = vec![
-            Line::from(self.deck.title.clone().bold()),
-            Line::from(
-                format!(
-                    "{} files · +{} -{}",
-                    self.files.len(),
-                    self.files.iter().map(FileDiff::added).sum::<usize>(),
-                    self.files.iter().map(FileDiff::deleted).sum::<usize>(),
-                )
-                .dim(),
-            ),
+            Line::from(self.deck.title.clone().bold().fg(ACCENT)),
             Line::default(),
         ];
-        if self.files.is_empty() {
-            lines.push(Line::from("no changes in this diff".italic()));
-        }
-        for fd in &self.files {
-            let (letter, style) = match fd.status {
-                FileStatus::Modified => ("M", Style::new().yellow()),
-                FileStatus::Added => ("A", Style::new().green()),
-                FileStatus::Deleted => ("D", Style::new().red()),
-                FileStatus::Renamed => ("R", Style::new().cyan()),
-            };
-            let mark = if pointed.contains(&fd.new_path.as_str()) {
-                "◆ "
+        for row in &rows {
+            let pad = " ".repeat(label_width - display_width(&row.label) + 2);
+            let bar_len = ((row.added + row.deleted) * 20).div_ceil(max_delta).max(1);
+            let label_style = if row.rest {
+                Style::new().dim()
             } else {
-                "  "
+                Style::new().bold()
             };
+            let dim_if_rest = |s: Style| if row.rest { s.add_modifier(Modifier::DIM) } else { s };
             lines.push(Line::from(vec![
-                Span::raw(mark),
-                Span::styled(letter, style),
-                Span::raw(" "),
-                Span::raw(fd.new_path.clone()),
-                Span::styled(format!("  +{}", fd.added()), Style::new().green()),
-                Span::styled(format!(" -{}", fd.deleted()), Style::new().red()),
+                Span::styled(row.label.clone(), label_style),
+                Span::raw(pad),
+                Span::styled(
+                    format!("{:>3} file{} ", row.files, if row.files == 1 { " " } else { "s" }),
+                    Style::new().dim(),
+                ),
+                Span::styled(format!("{:>7} ", format!("+{}", row.added)), dim_if_rest(Style::new().green())),
+                Span::styled(format!("{:>6}  ", format!("-{}", row.deleted)), dim_if_rest(Style::new().red())),
+                Span::styled("▇".repeat(bar_len), dim_if_rest(Style::new().fg(ACCENT))),
             ]));
         }
-        let width = 72.min(area.width);
+        let width = (label_width + 42).min(area.width as usize) as u16;
         let height = (lines.len() as u16).min(area.height);
         frame.render_widget(Paragraph::new(lines), centered(area, width, height));
     }
 
     fn draw_dive(&mut self, frame: &mut Frame, area: Rect, scroll: u16) {
-        let target = self.current().location().cloned();
-        let mut lines: Vec<Line> = Vec::new();
+        let target = self.current().anchor().cloned();
         let files: Vec<&FileDiff> = match &target {
             Some(at) => self.files.iter().filter(|f| f.new_path == at.file).collect(),
             None => self.files.iter().collect(),
@@ -377,10 +361,34 @@ impl App {
             render_note(frame, area, &msg);
             return;
         }
+        let mut lines: Vec<Line> = Vec::new();
         for fd in files {
+            let lang = Lang::from_path(&fd.new_path);
             for hunk in &fd.hunks {
-                lines.push(hunk_header(fd, hunk));
-                lines.extend(hunk_lines(hunk, target.as_ref().map(|t| t.line)));
+                let mut header = format!("── {}", fd.new_path);
+                if !hunk.section.is_empty() {
+                    header.push_str(&format!(" · {}", hunk.section));
+                }
+                lines.push(Line::from(header).style(Style::new().bold().dim()));
+                let segs = emphasize_hunk(hunk);
+                for (line, seg) in hunk.lines.iter().zip(segs) {
+                    let no = format!(
+                        "{:>5} ",
+                        line.new_no
+                            .or(line.old_no)
+                            .map(|n| n.to_string())
+                            .unwrap_or_default()
+                    );
+                    let mut spans = vec![Span::styled(no, Style::new().dim())];
+                    spans.extend(code_spans(lang, &line.text, line.kind, Some(&seg)));
+                    spans.insert(1, sign_span(line.kind));
+                    let mut out = Line::from(spans);
+                    if let Some(t) = &target
+                        && line.new_no == Some(t.focus()) {
+                            out = out.style(Style::new().bg(Color::DarkGray));
+                        }
+                    lines.push(out);
+                }
                 lines.push(Line::default());
             }
         }
@@ -389,10 +397,9 @@ impl App {
     }
 }
 
-// ---- helpers shared by renderers ------------------------------------
+// ---- shared rendering helpers ---------------------------------------
 
-/// Render the claim banner (if any) at the top and return the remaining
-/// body area.
+/// The claim: an accent bar, bold text, no box. Returns the body area.
 fn draw_claim(
     frame: &mut Frame,
     area: Rect,
@@ -403,116 +410,175 @@ fn draw_claim(
         return area;
     };
     let wrap_width = area.width.saturating_sub(4).max(1) as usize;
-    let claim_rows = (claim.chars().count().max(1)).div_ceil(wrap_width) as u16;
-    let height = (claim_rows + 2).min(area.height / 2).max(3);
+    let rows = display_width(claim).div_ceil(wrap_width).clamp(1, 3) as u16;
     let [top, _, body] = Layout::vertical([
-        Constraint::Length(height),
+        Constraint::Length(rows),
         Constraint::Length(1),
         Constraint::Min(1),
     ])
     .areas(area);
-    let mut block = Block::bordered().border_style(Style::new().dim());
-    if let Some(sev) = severity {
-        let style = match sev {
-            Severity::Low => Style::new().black().on_yellow(),
-            Severity::Medium => Style::new().black().on_light_yellow(),
-            Severity::High => Style::new().white().on_red(),
-        };
-        block = block.title(Span::styled(format!(" risk: {sev} "), style.bold()));
-    }
+    let [bar, text] =
+        Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).areas(top);
+    let (bar_style, tag) = match severity {
+        Some(s) => (
+            Style::new().fg(severity_color(s)),
+            Some(Span::styled(
+                format!(" {s} "),
+                Style::new().fg(Color::Black).bg(severity_color(s)).bold(),
+            )),
+        ),
+        None => (Style::new().fg(ACCENT), None),
+    };
     frame.render_widget(
-        Paragraph::new(claim.to_string().bold())
-            .wrap(Wrap { trim: false })
-            .block(block),
-        top,
+        Paragraph::new("▌\n".repeat(rows as usize)).style(bar_style),
+        bar,
+    );
+    let mut spans = Vec::new();
+    if let Some(tag) = tag {
+        spans.push(tag);
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(claim.to_string(), Style::new().bold()));
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+        text,
     );
     body
 }
 
-fn hunk_header<'a>(fd: &FileDiff, hunk: &Hunk) -> Line<'a> {
-    let mut text = format!("── {}", fd.new_path);
-    if !hunk.section.is_empty() {
-        text.push_str(&format!(" · {}", hunk.section));
+fn severity_color(s: Severity) -> Color {
+    match s {
+        Severity::Low => Color::Yellow,
+        Severity::Medium => Color::LightYellow,
+        Severity::High => Color::Red,
     }
-    Line::from(text).style(Style::new().bold().dim())
 }
 
-/// A hunk as displayable lines: dual line-number gutter, sign, word-level
-/// emphasis, target line marked.
-fn hunk_lines<'a>(hunk: &Hunk, target: Option<u32>) -> Vec<Line<'a>> {
-    let segs = emphasize_hunk(hunk);
-    hunk.lines
-        .iter()
-        .zip(segs)
-        .map(|(line, seg)| {
-            let (sign, base, emph) = match line.kind {
-                LineKind::Context => (" ", Style::new(), Style::new()),
-                LineKind::Del => (
-                    "-",
-                    Style::new().red(),
-                    Style::new().black().on_red(),
-                ),
-                LineKind::Add => (
-                    "+",
-                    Style::new().green(),
-                    Style::new().black().on_green(),
-                ),
-            };
-            let gutter = format!(
-                "{:>4} {:>4} ",
-                line.old_no.map(|n| n.to_string()).unwrap_or_default(),
-                line.new_no.map(|n| n.to_string()).unwrap_or_default(),
-            );
-            let mut spans = vec![
-                Span::styled(gutter, Style::new().dim()),
-                Span::styled(sign.to_string(), base),
-                Span::raw(" "),
-            ];
-            spans.extend(seg.into_iter().map(|Segment { text, emph: e }| {
-                Span::styled(text, if e { emph } else { base })
-            }));
-            let mut out = Line::from(spans);
-            if target.is_some() && line.new_no == target {
-                out = out.style(Style::new().bg(Color::DarkGray));
+fn file_header<'a>(path: &str) -> Line<'a> {
+    Line::from(format!("── {path}")).style(Style::new().dim())
+}
+
+/// Excerpt rows as slide lines: sign column, syntax colors, context dimmed,
+/// notes hanging under their lines.
+fn excerpt_lines<'a>(
+    rows: &[ExcerptRow],
+    lang: Lang,
+    notes: &[Note],
+    _focus: u32,
+) -> Vec<Line<'a>> {
+    let mut out = Vec::new();
+    for row in rows {
+        let mut spans = vec![sign_span(row.kind)];
+        spans.extend(code_spans(lang, &row.text, row.kind, row.segments.as_deref()));
+        out.push(Line::from(spans));
+        if let Some(no) = row.new_no {
+            for note in notes.iter().filter(|n| n.line == no) {
+                let indent: String = row
+                    .text
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect();
+                out.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(indent),
+                    Span::styled("└ ", Style::new().fg(ACCENT)),
+                    Span::styled(note.text.clone(), Style::new().fg(ACCENT).bold()),
+                ]));
             }
-            out
-        })
-        .collect()
-}
-
-fn side_line<'a>(no: Option<u32>, segs: &[Segment], base: Style) -> Line<'a> {
-    let emph = match base.fg {
-        Some(Color::Red) => Style::new().black().on_red(),
-        Some(Color::Green) => Style::new().black().on_green(),
-        _ => base,
-    };
-    let mut spans = vec![Span::styled(
-        format!("{:>4} ", no.map(|n| n.to_string()).unwrap_or_default()),
-        Style::new().dim(),
-    )];
-    spans.extend(
-        segs.iter()
-            .map(|s| Span::styled(s.text.clone(), if s.emph { emph } else { base })),
-    );
-    Line::from(spans)
-}
-
-fn line_is_target(hunk: &Hunk, target: u32, index: usize) -> bool {
-    hunk.lines
-        .get(index)
-        .is_some_and(|l| l.new_no == Some(target))
-}
-
-/// Scroll offset that keeps the first matching line in the middle third.
-fn scroll_to(lines: &[Line], height: u16, is_target: impl Fn(usize) -> bool) -> u16 {
-    if (lines.len() as u16) <= height {
-        return 0;
+        }
     }
-    // Header rows precede hunk rows; find the target among all rows.
-    let hit = (0..lines.len()).find(|&i| is_target(i.saturating_sub(1)));
-    let Some(hit) = hit else { return 0 };
-    let want = (hit as u16).saturating_sub(height / 3);
-    want.min((lines.len() as u16).saturating_sub(height))
+    out
+}
+
+fn sign_span<'a>(kind: LineKind) -> Span<'a> {
+    match kind {
+        LineKind::Context => Span::raw("  "),
+        LineKind::Add => Span::styled("+ ", Style::new().green().bold()),
+        LineKind::Del => Span::styled("- ", Style::new().red().dim()),
+    }
+}
+
+/// Syntax-highlighted spans for one code line, adjusted by its diff role:
+/// context sinks (DIM), deletions go quiet red, additions keep full syntax
+/// color with changed words bold-underlined.
+fn code_spans<'a>(
+    lang: Lang,
+    text: &str,
+    kind: LineKind,
+    segments: Option<&[Segment]>,
+) -> Vec<Span<'a>> {
+    match kind {
+        LineKind::Del => {
+            let base = Style::new().fg(Color::Red).add_modifier(Modifier::DIM);
+            let emph = Style::new().fg(Color::Red);
+            match segments {
+                Some(segs) => segs
+                    .iter()
+                    .map(|s| Span::styled(s.text.clone(), if s.emph { emph } else { base }))
+                    .collect(),
+                None => vec![Span::styled(text.to_string(), base)],
+            }
+        }
+        LineKind::Context => highlight(lang, text)
+            .into_iter()
+            .map(|run| Span::styled(run.text, run.style.add_modifier(Modifier::DIM)))
+            .collect(),
+        LineKind::Add => {
+            let runs = highlight(lang, text);
+            let Some(segs) = segments else {
+                return runs
+                    .into_iter()
+                    .map(|run| Span::styled(run.text, run.style))
+                    .collect();
+            };
+            // Overlay word emphasis on the syntax runs: mark each char,
+            // then rebuild runs with BOLD+UNDERLINED where emphasized.
+            let mut emph_flags = Vec::with_capacity(text.chars().count());
+            for seg in segs {
+                emph_flags.extend(std::iter::repeat_n(seg.emph, seg.text.chars().count()));
+            }
+            let mut spans = Vec::new();
+            let mut idx = 0;
+            for run in runs {
+                let mut cur = String::new();
+                let mut cur_emph = None;
+                for c in run.text.chars() {
+                    let e = emph_flags.get(idx).copied().unwrap_or(false);
+                    idx += 1;
+                    if cur_emph == Some(e) || cur.is_empty() {
+                        cur_emph = Some(e);
+                        cur.push(c);
+                    } else {
+                        spans.push(emph_span(cur, run.style, cur_emph.unwrap_or(false)));
+                        cur = c.to_string();
+                        cur_emph = Some(e);
+                    }
+                }
+                if !cur.is_empty() {
+                    spans.push(emph_span(cur, run.style, cur_emph.unwrap_or(false)));
+                }
+            }
+            spans
+        }
+    }
+}
+
+fn emph_span<'a>(text: String, base: Style, emph: bool) -> Span<'a> {
+    if emph {
+        Span::styled(
+            text,
+            base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )
+    } else {
+        Span::styled(text, base)
+    }
+}
+
+/// Rough display width: wide for CJK, 1 otherwise. Good enough for layout.
+fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| if (c as u32) > 0x1100 { 2 } else { 1 })
+        .sum()
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -546,6 +612,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use crate::deck::Group;
     use crate::diff::parse_unified;
 
     const SAMPLE: &str = "\
@@ -578,7 +645,7 @@ diff --git a/src/lib.rs b/src/lib.rs
     }
 
     fn screen(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
@@ -592,16 +659,24 @@ diff --git a/src/lib.rs b/src/lib.rs
     }
 
     #[test]
-    fn point_shows_claim_hunk_and_status() {
+    fn point_shows_claim_excerpt_and_note() {
         let mut app = app_with(vec![Step::Point {
-            at: "src/lib.rs:11".parse().unwrap(),
-            claim: "take() returns the value for the caller".into(),
+            at: "src/lib.rs:10-13".parse().unwrap(),
+            claim: "take() returns the value".into(),
+            notes: vec![Note {
+                line: 11,
+                text: "caller now owns it".into(),
+            }],
         }]);
         let s = screen(&mut app);
+        assert!(s.contains("▌"), "accent bar missing:\n{s}");
         assert!(s.contains("take() returns the value"), "claim missing:\n{s}");
-        assert!(s.contains("self.map.take(&id);"), "hunk missing:\n{s}");
-        assert!(s.contains("impl Session {"), "section missing:\n{s}");
-        assert!(s.contains("1/1 · point · src/lib.rs:11"), "status missing:\n{s}");
+        assert!(s.contains("self.map.take(&id);"), "add line missing:\n{s}");
+        assert!(s.contains("self.map.remove(&id);"), "del line missing:\n{s}");
+        assert!(s.contains("└ caller now owns it"), "note missing:\n{s}");
+        assert!(s.contains("1/1 · point · src/lib.rs:10-13"), "status missing:\n{s}");
+        // No line-number gutter on slides.
+        assert!(!s.contains(" 10 "), "line numbers should not appear:\n{s}");
     }
 
     #[test]
@@ -622,63 +697,61 @@ diff --git a/src/lib.rs b/src/lib.rs
             claim: None,
         }]);
         let s = screen(&mut app);
-        assert!(s.contains(" before "), "{s}");
-        assert!(s.contains(" after "), "{s}");
+        assert!(s.contains("── before"), "{s}");
+        assert!(s.contains("── after"), "{s}");
         assert!(s.contains("remove"), "{s}");
         assert!(s.contains("take"), "{s}");
     }
 
     #[test]
-    fn map_counts_files_and_marks_pointed_ones() {
-        let mut app = app_with(vec![
-            Step::Point {
-                at: "src/lib.rs:11".parse().unwrap(),
-                claim: "c".into(),
-            },
-            Step::Map,
-        ]);
-        app.step = 1;
-        let s = screen(&mut app);
-        assert!(s.contains("1 files · +1 -1"), "{s}");
-        assert!(s.contains("◆ M src/lib.rs"), "{s}");
-    }
-
-    #[test]
-    fn risk_shows_severity_badge() {
-        let mut app = app_with(vec![Step::Risk {
-            at: "src/lib.rs:11".parse().unwrap(),
-            claim: "take() changes the return type contract".into(),
-            severity: Severity::High,
+    fn map_aggregates_groups_and_rest() {
+        let mut app = app_with(vec![Step::Map {
+            groups: vec![Group {
+                label: "core".into(),
+                files: vec!["src/".into()],
+            }],
         }]);
         let s = screen(&mut app);
-        assert!(s.contains("risk: high"), "{s}");
+        assert!(s.contains("core"), "{s}");
+        assert!(s.contains("1 file"), "{s}");
+        assert!(s.contains("+1"), "{s}");
+        assert!(s.contains("-1"), "{s}");
+        assert!(!s.contains("その他"), "no rest row expected:\n{s}");
     }
 
     #[test]
-    fn dive_shows_full_hunk_and_missing_file_note() {
+    fn risk_shows_severity_tag() {
+        let mut app = app_with(vec![Step::Risk {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "contract change".into(),
+            severity: Severity::High,
+            notes: vec![],
+        }]);
+        let s = screen(&mut app);
+        assert!(s.contains(" high "), "{s}");
+        assert!(s.contains("contract change"), "{s}");
+    }
+
+    #[test]
+    fn dive_shows_full_hunk_with_line_numbers() {
         let mut app = app_with(vec![Step::Point {
             at: "src/lib.rs:11".parse().unwrap(),
             claim: "c".into(),
+            notes: vec![],
         }]);
         app.mode = Mode::Dive { scroll: 0 };
         let s = screen(&mut app);
         assert!(s.contains("self.notify();"), "{s}");
+        assert!(s.contains("11"), "dive keeps line numbers:\n{s}");
         assert!(s.contains("enter back"), "{s}");
-
-        let mut app = app_with(vec![Step::Point {
-            at: "src/gone.rs:1".parse().unwrap(),
-            claim: "c".into(),
-        }]);
-        app.mode = Mode::Dive { scroll: 0 };
-        let s = screen(&mut app);
-        assert!(s.contains("src/gone.rs is not in this diff"), "{s}");
     }
 
     #[test]
     fn missing_file_falls_back_to_note_not_panic() {
-        let mut app = app_with(vec![Step::Zoom {
+        let mut app = app_with(vec![Step::Point {
             at: "src/gone.rs:5".parse().unwrap(),
-            claim: None,
+            claim: "c".into(),
+            notes: vec![],
         }]);
         let s = screen(&mut app);
         assert!(s.contains("cannot read src/gone.rs"), "{s}");

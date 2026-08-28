@@ -4,10 +4,12 @@
 //! This layer knows nothing about the TUI. It turns a repository plus a
 //! location into data the viewer can draw.
 
+mod excerpt;
 mod git;
 mod parse;
 mod words;
 
+pub use excerpt::{ExcerptRow, excerpt};
 pub use git::{Repo, load_diff};
 pub use parse::{DiffLine, FileDiff, FileStatus, Hunk, LineKind, parse_unified};
 pub use words::{Segment, emphasize_hunk};

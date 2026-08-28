@@ -3,13 +3,15 @@
 A slide deck an agent writes and a person reads in the terminal, one claim to a
 screen.
 
-A deck holds no code. Every step points at `file:line`, and the viewer draws the
-real hunk out of the repository at display time, with word-level emphasis — so
-what is on screen is always what is in the tree, never a copy that has drifted.
+A deck holds no code. Every step points at a `file:start-end` range, and the
+viewer draws those lines out of the repository at display time — syntax
+highlighted, diff-aware with word-level emphasis, context dimmed — so what is
+on screen is always what is in the tree, never a copy that has drifted.
 
-Length is refused by the schema rather than asked for: a claim is at most 120
-characters and a deck at most 12 steps. Prose that will not fit does not get
-written.
+Selection is forced, not requested. A claim is one line (≤80 chars), an excerpt
+is at most 16 lines, an explanation is a ≤48-char note attached to the exact
+line it is about. Pointing at a whole block, or writing a paragraph, does not
+fit the format and does not get written.
 
 ## Use
 
@@ -29,16 +31,22 @@ steps:
   - type: cover
     what: "One line stating what was done"
     bullets: ["up to", "three", "lines"]
-  - type: map          # every touched file, +/- counts, drawn from the repo
+  - type: map          # the writer's summary of touched files; counts drawn from the repo
+    groups:
+      - label: "core"
+        files: ["src/session/"]     # trailing slash = directory prefix
+      - label: "api"
+        files: ["src/api.rs"]
   - type: point
-    at: "src/session.rs:142"
+    at: "src/session.rs:138-150"    # ≤16 lines; or file.rs:142 for line ± context
     claim: "The lock is now taken before the map read"
-  - type: before_after # old and new side by side for the hunk at `at`
-    at: "src/session.rs:142"
-  - type: zoom         # the file as it is now, centered on `at`
-    at: "src/session.rs:120"
+    notes:
+      - line: 142
+        text: "this ordering is the whole fix"
+  - type: before_after # old and new side by side for the same range
+    at: "src/session.rs:138-150"
   - type: risk
-    at: "src/api.rs:33"
+    at: "src/api.rs:30-38"
     claim: "Callers holding the old iterator see a torn view"
     severity: medium   # low | medium | high
 ```
@@ -48,11 +56,13 @@ steps:
 ## For agents
 
 Ask for `debrief schema`, write YAML or JSON, run `debrief check`. Validation
-errors are phrased as instructions ("claim: 145 chars, limit is 120 — cut 25");
-oversized decks do not pass, so the rewrite happens on the writing side, not in
-the reader's patience.
+errors are phrased as instructions ("claim: 95 chars, limit is 80 — cut 15";
+"spans 31 lines, limit is 16 — narrow to the lines that matter"); oversized
+decks do not pass, so the rewrite happens on the writing side, not in the
+reader's patience.
 
 ## Build
 
-Rust; `cargo build --release`. Renders diffs with its own parser and word-level
-LCS emphasis — `git` is the only external tool it runs.
+Rust; `cargo build --release`. Renders diffs with its own parser, word-level
+LCS emphasis, and its own minimal syntax highlighting — `git` is the only
+external tool it runs.

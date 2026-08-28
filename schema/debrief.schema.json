@@ -1,0 +1,189 @@
+{
+  "$defs": {
+    "Location": {
+      "description": "A place in the repository, written file:line (line on the new side of the diff), e.g. \"src/main.rs:42\".",
+      "pattern": "^.+:[1-9][0-9]*$",
+      "type": "string"
+    },
+    "Severity": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "type": "string"
+    },
+    "Step": {
+      "oneOf": [
+        {
+          "description": "Title slide: what happened, in at most three bullets.",
+          "properties": {
+            "bullets": {
+              "description": "Up to three supporting lines.",
+              "items": {
+                "maxLength": 120,
+                "type": "string"
+              },
+              "maxItems": 3,
+              "type": "array"
+            },
+            "type": {
+              "const": "cover",
+              "type": "string"
+            },
+            "what": {
+              "description": "One line stating what was done.",
+              "maxLength": 120,
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "what"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One claim about one place. The viewer shows the hunk at `at`.",
+          "properties": {
+            "at": {
+              "$ref": "#/$defs/Location"
+            },
+            "claim": {
+              "maxLength": 120,
+              "type": "string"
+            },
+            "type": {
+              "const": "point",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "at",
+            "claim"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Old and new side by side for the hunk at `at`.",
+          "properties": {
+            "at": {
+              "$ref": "#/$defs/Location"
+            },
+            "claim": {
+              "maxLength": 120,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "before_after",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "at"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The file as it is now, centered on `at` — for reading context,\nnot the change itself.",
+          "properties": {
+            "at": {
+              "$ref": "#/$defs/Location"
+            },
+            "claim": {
+              "maxLength": 120,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "zoom",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "at"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Something that could go wrong, anchored to where it lives.",
+          "properties": {
+            "at": {
+              "$ref": "#/$defs/Location"
+            },
+            "claim": {
+              "maxLength": 120,
+              "type": "string"
+            },
+            "severity": {
+              "$ref": "#/$defs/Severity"
+            },
+            "type": {
+              "const": "risk",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "at",
+            "claim",
+            "severity"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Overview of every file the diff touches. Drawn from the repo;\ncarries no content of its own.",
+          "properties": {
+            "type": {
+              "const": "map",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "base": {
+      "description": "Git rev to diff against (e.g. \"main\", \"HEAD~3\"). Defaults to HEAD:\nuncommitted changes against the last commit.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "steps": {
+      "description": "The slides. At most 12 — the schema refuses more.",
+      "items": {
+        "$ref": "#/$defs/Step"
+      },
+      "maxItems": 12,
+      "minItems": 1,
+      "type": "array"
+    },
+    "title": {
+      "description": "One line naming what this deck reports on.",
+      "maxLength": 120,
+      "type": "string"
+    }
+  },
+  "required": [
+    "title",
+    "steps"
+  ],
+  "title": "Deck",
+  "type": "object"
+}

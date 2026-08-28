@@ -17,6 +17,7 @@ fit the format and does not get written.
 
 ```
 debrief report.yaml        # view: n next, p prev, Enter dive into the diff, q quit
+                           # mouse: click the outline to jump, wheel to move
 debrief check report.yaml  # validate; exit 1 with exactly what to cut
 debrief schema             # the JSON Schema agents write decks against
 ```

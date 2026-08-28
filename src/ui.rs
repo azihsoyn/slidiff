@@ -13,8 +13,11 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Margin, Rect};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
@@ -37,9 +40,12 @@ pub fn run(deck: Deck, repo: Repo) -> Result<()> {
         step: 0,
         mode: Mode::Steps,
         file_cache: HashMap::new(),
+        strip_boxes: Vec::new(),
     };
     let mut terminal = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let result = app.event_loop(&mut terminal);
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -57,6 +63,8 @@ struct App {
     step: usize,
     mode: Mode,
     file_cache: HashMap<String, Option<Vec<String>>>,
+    /// Filmstrip hit areas, refreshed on every draw: (box, step index).
+    strip_boxes: Vec<(Rect, usize)>,
 }
 
 const ACCENT: Color = Color::Cyan;
@@ -133,12 +141,31 @@ impl App {
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         loop {
             terminal.draw(|frame| self.draw(frame))?;
-            let Event::Key(key) = event::read()? else {
-                continue;
+            let key = match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => key,
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            self.on_click(mouse.column, mouse.row);
+                        }
+                        MouseEventKind::ScrollDown => match &mut self.mode {
+                            Mode::Steps => {
+                                if self.step + 1 < self.deck.steps.len() {
+                                    self.step += 1;
+                                }
+                            }
+                            Mode::Dive { scroll } => *scroll = scroll.saturating_add(3),
+                        },
+                        MouseEventKind::ScrollUp => match &mut self.mode {
+                            Mode::Steps => self.step = self.step.saturating_sub(1),
+                            Mode::Dive { scroll } => *scroll = scroll.saturating_sub(3),
+                        },
+                        _ => {}
+                    }
+                    continue;
+                }
+                _ => continue,
             };
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
             let ctrl_c = key.code == KeyCode::Char('c')
                 && key.modifiers.contains(KeyModifiers::CONTROL);
             if ctrl_c || key.code == KeyCode::Char('q') {
@@ -244,21 +271,23 @@ impl App {
         frame.render_widget(Paragraph::new(right).style(Style::new().dim()), r);
     }
 
-    /// One little numbered box per step, current one lit. The outline the
-    /// reader keeps in the corner of their eye.
-    fn draw_filmstrip(&self, frame: &mut Frame, area: Rect) {
+    /// One little numbered box per step, current one lit — the outline the
+    /// reader keeps in the corner of their eye. Clicking a box jumps there.
+    fn draw_filmstrip(&mut self, frame: &mut Frame, area: Rect) {
+        self.strip_boxes.clear();
         let n = self.deck.steps.len() as u16;
         let box_w: u16 = 6;
         let total = n * (box_w + 1) - 1;
         if area.width >= total {
             let x0 = area.x + (area.width - total) / 2;
-            for (i, step) in self.deck.steps.iter().enumerate() {
+            for i in 0..self.deck.steps.len() {
                 let rect = Rect {
                     x: x0 + i as u16 * (box_w + 1),
                     y: area.y,
                     width: box_w,
                     height: 3,
                 };
+                self.strip_boxes.push((rect, i));
                 let current = i == self.step;
                 let style = if current {
                     Style::new().fg(ACCENT).bold()
@@ -272,9 +301,7 @@ impl App {
                     rect,
                 );
                 frame.render_widget(
-                    Paragraph::new(format!("{}{}", i + 1, step_glyph(step)))
-                        .centered()
-                        .style(style),
+                    Paragraph::new(format!("{}", i + 1)).centered().style(style),
                     rect.inner(Margin {
                         horizontal: 1,
                         vertical: 1,
@@ -282,23 +309,55 @@ impl App {
                 );
             }
         } else {
+            let labels: Vec<String> =
+                (1..=self.deck.steps.len()).map(|i| format!(" {i} ")).collect();
+            let total: u16 = labels.iter().map(|l| l.len() as u16).sum();
+            let y = area.y + area.height / 2;
+            let mut x = area.x + area.width.saturating_sub(total) / 2;
             let mut spans = Vec::new();
-            for (i, step) in self.deck.steps.iter().enumerate() {
-                let label = format!(" {}{} ", i + 1, step_glyph(step));
+            for (i, label) in labels.iter().enumerate() {
+                let w = label.len() as u16;
+                self.strip_boxes.push((
+                    Rect {
+                        x,
+                        y,
+                        width: w,
+                        height: 1,
+                    },
+                    i,
+                ));
+                x += w;
                 if i == self.step {
-                    spans.push(Span::styled(label, Style::new().fg(Color::Black).bg(ACCENT)));
+                    spans.push(Span::styled(
+                        label.clone(),
+                        Style::new().fg(Color::Black).bg(ACCENT),
+                    ));
                 } else {
-                    spans.push(Span::styled(label, Style::new().dim()));
+                    spans.push(Span::styled(label.clone(), Style::new().dim()));
                 }
             }
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).centered(),
                 Rect {
-                    y: area.y + area.height / 2,
+                    y,
                     height: 1,
                     ..area
                 },
             );
+        }
+    }
+
+    fn on_click(&mut self, x: u16, y: u16) {
+        if !matches!(self.mode, Mode::Steps) {
+            return;
+        }
+        let pos = Position { x, y };
+        if let Some(&(_, step)) = self
+            .strip_boxes
+            .iter()
+            .find(|(rect, _)| rect.contains(pos))
+        {
+            self.step = step;
         }
     }
 
@@ -573,16 +632,6 @@ impl App {
 
 // ---- shared rendering helpers ---------------------------------------
 
-fn step_glyph(step: &Step) -> &'static str {
-    match step {
-        Step::Cover { .. } => "◇",
-        Step::Map { .. } => "▦",
-        Step::Point { .. } => "●",
-        Step::BeforeAfter { .. } => "◐",
-        Step::Risk { .. } => "▲",
-    }
-}
-
 /// The claim: an accent bar, bold text, no box. Returns the body area.
 fn draw_claim(
     frame: &mut Frame,
@@ -845,6 +894,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             step: 0,
             mode: Mode::Steps,
             file_cache: HashMap::new(),
+            strip_boxes: Vec::new(),
         }
     }
 
@@ -879,7 +929,7 @@ diff --git a/src/lib.rs b/src/lib.rs
         assert!(s.contains("self.map.remove(&id);"), "del line missing:\n{s}");
         assert!(s.contains("└ caller now owns it"), "note missing:\n{s}");
         assert!(s.contains("╭"), "page frame missing:\n{s}");
-        assert!(s.contains("1●"), "filmstrip missing:\n{s}");
+        assert!(!app.strip_boxes.is_empty(), "filmstrip hit areas missing");
         assert!(s.contains("covers +1/+1"), "coverage missing:\n{s}");
         // No sign column, no line numbers on slides.
         assert!(!s.contains("+ self.map"), "sign column should be gone:\n{s}");
@@ -986,6 +1036,30 @@ diff --git a/f.rs b/f.rs
         assert!(s.contains("self.notify();"), "{s}");
         assert!(s.contains("11"), "dive keeps line numbers:\n{s}");
         assert!(s.contains("enter back"), "{s}");
+    }
+
+    #[test]
+    fn clicking_a_filmstrip_box_jumps_to_that_step() {
+        let mut app = app_with(vec![
+            Step::Cover {
+                what: "w".into(),
+                bullets: vec![],
+            },
+            Step::Point {
+                at: "src/lib.rs:11".parse().unwrap(),
+                claim: "c".into(),
+                notes: vec![],
+            },
+        ]);
+        screen(&mut app); // draw once to populate hit areas
+        assert_eq!(app.strip_boxes.len(), 2);
+        let (second_box, idx) = app.strip_boxes[1];
+        assert_eq!(idx, 1);
+        app.on_click(second_box.x + 1, second_box.y + 1);
+        assert_eq!(app.step, 1);
+        // A click outside every box changes nothing.
+        app.on_click(0, 0);
+        assert_eq!(app.step, 1);
     }
 
     #[test]

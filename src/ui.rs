@@ -20,7 +20,7 @@ use crossterm::event::{
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::deck::{Anchor, Deck, Group, Note, Severity, Step};
@@ -39,7 +39,7 @@ pub fn run(deck: Deck, repo: Repo) -> Result<()> {
         coverage,
         step: 0,
         mode: Mode::Steps,
-        show_notes: true,
+        notes_view: NotesView::Panel,
         file_cache: HashMap::new(),
         strip_boxes: Vec::new(),
     };
@@ -56,6 +56,24 @@ enum Mode {
     Dive { scroll: u16 },
 }
 
+/// How the speaker notes are shown. `s` cycles panel → popup → hidden.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NotesView {
+    Panel,
+    Popup,
+    Hidden,
+}
+
+impl NotesView {
+    fn next(self) -> NotesView {
+        match self {
+            NotesView::Panel => NotesView::Popup,
+            NotesView::Popup => NotesView::Hidden,
+            NotesView::Hidden => NotesView::Panel,
+        }
+    }
+}
+
 struct App {
     deck: Deck,
     repo: Repo,
@@ -63,8 +81,7 @@ struct App {
     coverage: Coverage,
     step: usize,
     mode: Mode,
-    /// Speaker notes panel below the slide, toggled with `s`.
-    show_notes: bool,
+    notes_view: NotesView,
     file_cache: HashMap<String, Option<Vec<String>>>,
     /// Filmstrip hit areas, refreshed on every draw: (box, step index).
     strip_boxes: Vec<(Rect, usize)>,
@@ -184,9 +201,15 @@ impl App {
                     KeyCode::Char('p' | 'k') | KeyCode::Left | KeyCode::Up => {
                         self.step = self.step.saturating_sub(1);
                     }
-                    KeyCode::Char('s') => self.show_notes = !self.show_notes,
+                    KeyCode::Char('s') => self.notes_view = self.notes_view.next(),
                     KeyCode::Enter => self.mode = Mode::Dive { scroll: 0 },
-                    KeyCode::Esc => return Ok(()),
+                    KeyCode::Esc => {
+                        if self.notes_view == NotesView::Popup {
+                            self.notes_view = NotesView::Panel;
+                        } else {
+                            return Ok(());
+                        }
+                    }
                     _ => {}
                 },
                 Mode::Dive { scroll } => match key.code {
@@ -221,25 +244,19 @@ impl App {
         match self.mode {
             Mode::Steps => {
                 let area = frame.area();
-                let strip_h = if area.height >= 14 { 3 } else { 0 };
-                let page_w = page_width(area);
-                let notes_text = self
-                    .show_notes
-                    .then(|| self.current().speaker_notes())
-                    .flatten()
-                    .map(str::to_string);
-                let notes_h = match &notes_text {
-                    Some(text) => notes_height(text, page_w, area.height / 3),
-                    None => 0,
-                };
-                let [main, notes, strip, status] = Layout::vertical([
-                    Constraint::Min(1),
-                    Constraint::Length(notes_h),
-                    Constraint::Length(strip_h),
+                // Fixed geometry, derived from the terminal size alone:
+                // the page never moves or resizes between slides.
+                let geo = Geometry::of(area);
+                let [_, page_row, notes_row, _, strip, status] = Layout::vertical([
+                    Constraint::Fill(1),
+                    Constraint::Length(geo.page_h),
+                    Constraint::Length(geo.notes_h),
+                    Constraint::Fill(2),
+                    Constraint::Length(geo.strip_h),
                     Constraint::Length(1),
                 ])
                 .areas(area);
-                let page = page_rect(main, page_w);
+                let page = center_h(page_row, geo.page_w);
                 frame.render_widget(
                     Block::bordered()
                         .border_type(BorderType::Rounded)
@@ -251,13 +268,19 @@ impl App {
                     vertical: 1,
                 });
                 self.draw_step(frame, inner);
-                if let Some(text) = notes_text {
-                    draw_speaker_notes(frame, notes, page_w, &text);
-                }
-                if strip_h > 0 {
+                let notes_text = self.current().speaker_notes().map(str::to_string);
+                if self.notes_view == NotesView::Panel
+                    && let Some(text) = &notes_text {
+                        draw_speaker_notes(frame, notes_row, geo.page_w, text);
+                    }
+                if geo.strip_h > 0 {
                     self.draw_filmstrip(frame, strip);
                 }
                 self.draw_status(frame, status);
+                if self.notes_view == NotesView::Popup
+                    && let Some(text) = &notes_text {
+                        draw_notes_popup(frame, area, text);
+                    }
             }
             Mode::Dive { scroll } => {
                 let [body, status] =
@@ -839,61 +862,101 @@ fn display_width(s: &str) -> usize {
         .sum()
 }
 
-/// Slide width for a given terminal area: margins on both sides, capped.
-fn page_width(area: Rect) -> u16 {
-    area.width.saturating_sub(10).clamp(20, 96)
+/// The fixed layout of the steps screen, derived from the terminal size
+/// alone. Content never changes it — a slide is a fixed canvas, and prose
+/// that does not fit belongs in the notes, not on a stretched page.
+struct Geometry {
+    page_w: u16,
+    page_h: u16,
+    notes_h: u16,
+    strip_h: u16,
 }
 
-/// The page the slide is drawn on: 16:9-ish (terminal cells are ~1:2, so
-/// rows ≈ cols × 9⁄32), centered in the remaining space like a slide on
-/// a canvas.
-fn page_rect(area: Rect, width: u16) -> Rect {
-    let height = (u32::from(width) * 9 / 32).max(10) as u16;
-    let height = height.min(area.height);
+impl Geometry {
+    fn of(area: Rect) -> Geometry {
+        let strip_h = if area.height >= 22 { 3 } else { 0 };
+        let page_w = area.width.saturating_sub(10).clamp(20, 96);
+        // 16:9-ish: terminal cells are ~1:2, so rows ≈ cols × 9⁄32.
+        let mut page_h = ((u32::from(page_w) * 9 / 32) as u16).max(10);
+        let mut notes_h: u16 = 7;
+        let avail = area.height.saturating_sub(strip_h + 1 + 2);
+        if page_h + notes_h > avail {
+            page_h = page_h.min(avail.saturating_sub(notes_h)).max(8);
+        }
+        if page_h + notes_h > avail {
+            notes_h = avail.saturating_sub(page_h);
+        }
+        Geometry {
+            page_w,
+            page_h,
+            notes_h,
+            strip_h,
+        }
+    }
+}
+
+/// Center a fixed width horizontally in `area`.
+fn center_h(area: Rect, width: u16) -> Rect {
+    let [_, mid, _] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(width),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    mid
+}
+
+/// The speaker notes directly under the slide: prose the writer kept off
+/// the page, markdown-rendered, aligned to the slide. Quiet chrome.
+fn draw_speaker_notes(frame: &mut Frame, area: Rect, page_w: u16, text: &str) {
+    if area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(crate::md::render(text))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::new()
+                    .borders(ratatui::widgets::Borders::TOP)
+                    .border_style(Style::new().dim())
+                    .title(Span::styled(" notes · s to expand ", Style::new().dim())),
+            ),
+        center_h(area, page_w),
+    );
+}
+
+/// The expanded notes: a popup floating over the slide, for reading a
+/// long note comfortably. `s` again or Esc dismisses it.
+fn draw_notes_popup(frame: &mut Frame, area: Rect, text: &str) {
+    let width = area.width.saturating_sub(8).clamp(20, 80);
+    let lines = crate::md::render(text);
+    let wrap_w = usize::from(width.saturating_sub(4).max(1));
+    let rows: usize = lines
+        .iter()
+        .map(|l| {
+            let w: usize = l.spans.iter().map(|s| display_width(&s.content)).sum();
+            w.div_ceil(wrap_w).max(1)
+        })
+        .sum();
+    let height = (rows as u16 + 2).min(area.height.saturating_mul(3) / 4).max(3);
     let [_, mid, _] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(height),
         Constraint::Fill(1),
     ])
     .areas(area);
-    let [_, mid, _] = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(width),
-        Constraint::Fill(1),
-    ])
-    .areas(mid);
-    mid
-}
-
-/// Rows the notes panel needs for `text` at the page width, capped.
-fn notes_height(text: &str, page_w: u16, cap: u16) -> u16 {
-    let wrap_w = usize::from(page_w.saturating_sub(2).max(1));
-    let rows: usize = text
-        .lines()
-        .map(|l| display_width(l).div_ceil(wrap_w).max(1))
-        .sum();
-    (rows as u16 + 1).min(cap.max(3))
-}
-
-/// The speaker notes under the slide: prose the writer kept off the page,
-/// for the reader who wants it. Aligned to the slide, quiet chrome.
-fn draw_speaker_notes(frame: &mut Frame, area: Rect, page_w: u16, text: &str) {
-    let [_, mid, _] = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(page_w),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
+    let popup = center_h(mid, width);
+    frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(text.to_string())
+        Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(
-                Block::new()
-                    .borders(ratatui::widgets::Borders::TOP)
-                    .border_style(Style::new().dim())
-                    .title(Span::styled(" notes · s to hide ", Style::new().dim())),
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().fg(ACCENT))
+                    .title(Span::styled(" notes · s to hide ", Style::new().fg(ACCENT))),
             ),
-        mid,
+        popup,
     );
 }
 
@@ -959,7 +1022,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             coverage,
             step: 0,
             mode: Mode::Steps,
-            show_notes: true,
+            notes_view: NotesView::Panel,
             file_cache: HashMap::new(),
             strip_boxes: Vec::new(),
         }
@@ -1117,12 +1180,16 @@ diff --git a/f.rs b/f.rs
             at: "src/lib.rs:11".parse().unwrap(),
             claim: "short claim".into(),
             notes: vec![],
-            speaker_notes: Some("the long prose lands under the slide".into()),
+            speaker_notes: Some("the **long** prose lands under the slide".into()),
         }]);
         let s = screen(&mut app);
         assert!(s.contains("the long prose lands under the slide"), "{s}");
-        assert!(s.contains(" notes · s to hide "), "{s}");
-        app.show_notes = false;
+        assert!(s.contains(" notes · s to expand "), "{s}");
+        app.notes_view = NotesView::Popup;
+        let s = screen(&mut app);
+        assert!(s.contains(" notes · s to hide "), "popup missing:\n{s}");
+        assert!(s.contains("the long prose"), "{s}");
+        app.notes_view = NotesView::Hidden;
         let s = screen(&mut app);
         assert!(!s.contains("long prose"), "notes should hide:\n{s}");
     }
@@ -1137,6 +1204,36 @@ diff --git a/f.rs b/f.rs
         let s = screen(&mut app);
         let first_border = s.lines().position(|l| l.contains("╭─")).unwrap();
         assert!(first_border > 0, "page should not start at row 0:\n{s}");
+    }
+
+    #[test]
+    fn page_geometry_never_shifts_between_steps() {
+        let mut app = app_with(vec![
+            Step::Point {
+                at: "src/lib.rs:11".parse().unwrap(),
+                claim: "with notes".into(),
+                notes: vec![],
+                speaker_notes: Some("some prose\nover two lines".into()),
+            },
+            Step::Point {
+                at: "src/lib.rs:11".parse().unwrap(),
+                claim: "without notes".into(),
+                notes: vec![],
+                speaker_notes: None,
+            },
+        ]);
+        let page_top = |s: &str| {
+            s.lines()
+                .position(|l| l.contains("╭──────────"))
+                .expect("page border")
+        };
+        let first = page_top(&screen(&mut app));
+        app.step = 1;
+        let second = page_top(&screen(&mut app));
+        assert_eq!(first, second, "page moved between steps");
+        app.notes_view = NotesView::Hidden;
+        let third = page_top(&screen(&mut app));
+        assert_eq!(first, third, "page moved when notes toggled");
     }
 
     #[test]

@@ -27,6 +27,10 @@ steps:
         text: "claim は 1 行分だけ"
       - line: 32
         text: "ブロック丸ごとの切り出しは通らない"
+    speaker_notes: |-
+      スライドに載る文はスキーマが短く強制する。ここに書いているような長い散文は
+      speaker_notes だけに許され、スライドの下のパネルに出る（s で隠せる）。
+      読み手が詳細を読むかどうかを選ぶ。
   - type: point
     at: "src/deck.rs:302-310"
     claim: "validation エラーは書き直しの指示文になっている"

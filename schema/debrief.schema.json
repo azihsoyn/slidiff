@@ -71,6 +71,14 @@
               "maxItems": 3,
               "type": "array"
             },
+            "speaker_notes": {
+              "description": "Longer prose for the reader who wants the detail. Shown below\nthe slide, never on it.",
+              "maxLength": 600,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "const": "cover",
               "type": "string"
@@ -104,6 +112,13 @@
               "maxItems": 3,
               "type": "array"
             },
+            "speaker_notes": {
+              "maxLength": 600,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "const": "point",
               "type": "string"
@@ -124,6 +139,13 @@
             },
             "claim": {
               "maxLength": 80,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "speaker_notes": {
+              "maxLength": 600,
               "type": [
                 "string",
                 "null"
@@ -160,6 +182,13 @@
             "severity": {
               "$ref": "#/$defs/Severity"
             },
+            "speaker_notes": {
+              "maxLength": 600,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "const": "risk",
               "type": "string"
@@ -183,6 +212,13 @@
               "maxItems": 6,
               "minItems": 1,
               "type": "array"
+            },
+            "speaker_notes": {
+              "maxLength": 600,
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "const": "map",

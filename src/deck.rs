@@ -35,6 +35,8 @@ pub const DEFAULT_CONTEXT: u32 = 4;
 /// Map groups: the summary of touched files, written by the agent.
 pub const MAX_GROUPS: usize = 6;
 pub const MAX_GROUP_LABEL_CHARS: usize = 24;
+/// Speaker notes: the one place prose is allowed. Off-slide, reader-opt-in.
+pub const MAX_SPEAKER_NOTES_CHARS: usize = 600;
 /// Deck title shares the claim limit.
 pub const MAX_TITLE_CHARS: usize = 80;
 
@@ -65,6 +67,11 @@ pub enum Step {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[schemars(length(max = 3), inner(length(max = 60)))]
         bullets: Vec<String>,
+        /// Longer prose for the reader who wants the detail. Shown below
+        /// the slide, never on it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(max = 600))]
+        speaker_notes: Option<String>,
     },
     /// One claim about one excerpt. The viewer shows the chosen lines —
     /// diff-aware when they changed, plain code when they did not — with
@@ -76,6 +83,9 @@ pub enum Step {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[schemars(length(max = 3))]
         notes: Vec<Note>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(max = 600))]
+        speaker_notes: Option<String>,
     },
     /// Old and new side by side for the excerpt at `at`.
     BeforeAfter {
@@ -83,6 +93,9 @@ pub enum Step {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schemars(length(max = 80))]
         claim: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(max = 600))]
+        speaker_notes: Option<String>,
     },
     /// A point that could go wrong, with a severity.
     Risk {
@@ -93,6 +106,9 @@ pub enum Step {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[schemars(length(max = 3))]
         notes: Vec<Note>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(max = 600))]
+        speaker_notes: Option<String>,
     },
     /// The touched files, summarized by the writer into named groups.
     /// Files not covered by any group aggregate into an automatic rest row.
@@ -100,6 +116,9 @@ pub enum Step {
     Map {
         #[schemars(length(min = 1, max = 6))]
         groups: Vec<Group>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[schemars(length(max = 600))]
+        speaker_notes: Option<String>,
     },
 }
 
@@ -149,6 +168,16 @@ impl Step {
         match self {
             Step::Point { notes, .. } | Step::Risk { notes, .. } => notes,
             _ => &[],
+        }
+    }
+
+    pub fn speaker_notes(&self) -> Option<&str> {
+        match self {
+            Step::Cover { speaker_notes, .. }
+            | Step::Point { speaker_notes, .. }
+            | Step::BeforeAfter { speaker_notes, .. }
+            | Step::Risk { speaker_notes, .. }
+            | Step::Map { speaker_notes, .. } => speaker_notes.as_deref(),
         }
     }
 }
@@ -298,6 +327,9 @@ impl Deck {
 
         for (i, step) in self.steps.iter().enumerate() {
             let at = |field: &str| format!("steps[{i}] ({}).{field}", step.type_name());
+            if let Some(sn) = step.speaker_notes() {
+                check_len(&at("speaker_notes"), sn, MAX_SPEAKER_NOTES_CHARS, &mut errors);
+            }
             if let Some(anchor) = step.anchor() {
                 if let Some(end) = anchor.end {
                     let span = end - anchor.start + 1;
@@ -333,7 +365,7 @@ impl Deck {
                 }
             }
             match step {
-                Step::Cover { what, bullets } => {
+                Step::Cover { what, bullets, .. } => {
                     check_len(&at("what"), what, MAX_CLAIM_CHARS, &mut errors);
                     if bullets.len() > MAX_BULLETS {
                         errors.push(format!(
@@ -361,7 +393,7 @@ impl Deck {
                         check_len(&at("claim"), claim, MAX_CLAIM_CHARS, &mut errors);
                     }
                 }
-                Step::Map { groups } => {
+                Step::Map { groups, .. } => {
                     if groups.is_empty() {
                         errors.push(format!(
                             "{}: empty — a map is the writer's summary; name at least one group",
@@ -439,6 +471,7 @@ mod tests {
                 at: "a.rs:10-40".parse().unwrap(),
                 claim: "c".into(),
                 notes: vec![],
+                speaker_notes: None,
             }],
         };
         let errors = deck.validate();
@@ -458,6 +491,7 @@ mod tests {
                     line: 20,
                     text: "n".into(),
                 }],
+                speaker_notes: None,
             }],
         };
         let errors = deck.validate();
@@ -474,6 +508,7 @@ mod tests {
                 at: "a.rs:1".parse().unwrap(),
                 claim: "c".repeat(85),
                 notes: vec![],
+                speaker_notes: None,
             }],
         };
         let errors = deck.validate();
@@ -490,6 +525,7 @@ mod tests {
             steps: vec![Step::Cover {
                 what: "w".into(),
                 bullets: vec![],
+                speaker_notes: None,
             }],
         };
         assert!(deck.validate().is_empty());
@@ -497,7 +533,7 @@ mod tests {
 
     #[test]
     fn validate_refuses_thirteenth_step_and_empty_map() {
-        let step = Step::Map { groups: vec![] };
+        let step = Step::Map { groups: vec![], speaker_notes: None };
         let deck = Deck {
             title: "t".into(),
             base: None,

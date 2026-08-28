@@ -39,6 +39,7 @@ pub fn run(deck: Deck, repo: Repo) -> Result<()> {
         coverage,
         step: 0,
         mode: Mode::Steps,
+        show_notes: true,
         file_cache: HashMap::new(),
         strip_boxes: Vec::new(),
     };
@@ -62,6 +63,8 @@ struct App {
     coverage: Coverage,
     step: usize,
     mode: Mode,
+    /// Speaker notes panel below the slide, toggled with `s`.
+    show_notes: bool,
     file_cache: HashMap<String, Option<Vec<String>>>,
     /// Filmstrip hit areas, refreshed on every draw: (box, step index).
     strip_boxes: Vec<(Rect, usize)>,
@@ -181,6 +184,7 @@ impl App {
                     KeyCode::Char('p' | 'k') | KeyCode::Left | KeyCode::Up => {
                         self.step = self.step.saturating_sub(1);
                     }
+                    KeyCode::Char('s') => self.show_notes = !self.show_notes,
                     KeyCode::Enter => self.mode = Mode::Dive { scroll: 0 },
                     KeyCode::Esc => return Ok(()),
                     _ => {}
@@ -216,14 +220,26 @@ impl App {
     fn draw(&mut self, frame: &mut Frame) {
         match self.mode {
             Mode::Steps => {
-                let strip_h = if frame.area().height >= 14 { 3 } else { 0 };
-                let [main, strip, status] = Layout::vertical([
+                let area = frame.area();
+                let strip_h = if area.height >= 14 { 3 } else { 0 };
+                let page_w = page_width(area);
+                let notes_text = self
+                    .show_notes
+                    .then(|| self.current().speaker_notes())
+                    .flatten()
+                    .map(str::to_string);
+                let notes_h = match &notes_text {
+                    Some(text) => notes_height(text, page_w, area.height / 3),
+                    None => 0,
+                };
+                let [main, notes, strip, status] = Layout::vertical([
                     Constraint::Min(1),
+                    Constraint::Length(notes_h),
                     Constraint::Length(strip_h),
                     Constraint::Length(1),
                 ])
-                .areas(frame.area());
-                let page = page_rect(main);
+                .areas(area);
+                let page = page_rect(main, page_w);
                 frame.render_widget(
                     Block::bordered()
                         .border_type(BorderType::Rounded)
@@ -235,6 +251,9 @@ impl App {
                     vertical: 1,
                 });
                 self.draw_step(frame, inner);
+                if let Some(text) = notes_text {
+                    draw_speaker_notes(frame, notes, page_w, &text);
+                }
                 if strip_h > 0 {
                     self.draw_filmstrip(frame, strip);
                 }
@@ -261,7 +280,7 @@ impl App {
             left.push_str(&format!(" · {at}"));
         }
         left.push_str(&format!(" · {}", self.coverage.summary()));
-        let right = "n next · p prev · enter diff · q quit ";
+        let right = "n next · p prev · s notes · enter diff · q quit ";
         let [l, r] = Layout::horizontal([
             Constraint::Min(1),
             Constraint::Length(right.len() as u16),
@@ -363,8 +382,8 @@ impl App {
 
     fn draw_step(&mut self, frame: &mut Frame, area: Rect) {
         match self.current().clone() {
-            Step::Cover { what, bullets } => self.draw_cover(frame, area, &what, &bullets),
-            Step::Point { at, claim, notes } => {
+            Step::Cover { what, bullets, .. } => self.draw_cover(frame, area, &what, &bullets),
+            Step::Point { at, claim, notes, .. } => {
                 self.draw_excerpt_slide(frame, area, &at, Some(&claim), &notes, None)
             }
             Step::Risk {
@@ -372,11 +391,12 @@ impl App {
                 claim,
                 severity,
                 notes,
+                ..
             } => self.draw_excerpt_slide(frame, area, &at, Some(&claim), &notes, Some(severity)),
-            Step::BeforeAfter { at, claim } => {
+            Step::BeforeAfter { at, claim, .. } => {
                 self.draw_before_after(frame, area, &at, claim.as_deref())
             }
-            Step::Map { groups } => self.draw_map(frame, area, &groups),
+            Step::Map { groups, .. } => self.draw_map(frame, area, &groups),
         }
     }
 
@@ -819,16 +839,62 @@ fn display_width(s: &str) -> usize {
         .sum()
 }
 
-/// The page the slide is drawn on: centered, capped width, full height.
-fn page_rect(area: Rect) -> Rect {
-    let width = area.width.saturating_sub(4).clamp(20, 110);
+/// Slide width for a given terminal area: margins on both sides, capped.
+fn page_width(area: Rect) -> u16 {
+    area.width.saturating_sub(10).clamp(20, 96)
+}
+
+/// The page the slide is drawn on: 16:9-ish (terminal cells are ~1:2, so
+/// rows ≈ cols × 9⁄32), centered in the remaining space like a slide on
+/// a canvas.
+fn page_rect(area: Rect, width: u16) -> Rect {
+    let height = (u32::from(width) * 9 / 32).max(10) as u16;
+    let height = height.min(area.height);
+    let [_, mid, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(height),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
     let [_, mid, _] = Layout::horizontal([
         Constraint::Fill(1),
         Constraint::Length(width),
         Constraint::Fill(1),
     ])
-    .areas(area);
+    .areas(mid);
     mid
+}
+
+/// Rows the notes panel needs for `text` at the page width, capped.
+fn notes_height(text: &str, page_w: u16, cap: u16) -> u16 {
+    let wrap_w = usize::from(page_w.saturating_sub(2).max(1));
+    let rows: usize = text
+        .lines()
+        .map(|l| display_width(l).div_ceil(wrap_w).max(1))
+        .sum();
+    (rows as u16 + 1).min(cap.max(3))
+}
+
+/// The speaker notes under the slide: prose the writer kept off the page,
+/// for the reader who wants it. Aligned to the slide, quiet chrome.
+fn draw_speaker_notes(frame: &mut Frame, area: Rect, page_w: u16, text: &str) {
+    let [_, mid, _] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(page_w),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(text.to_string())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::new()
+                    .borders(ratatui::widgets::Borders::TOP)
+                    .border_style(Style::new().dim())
+                    .title(Span::styled(" notes · s to hide ", Style::new().dim())),
+            ),
+        mid,
+    );
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -893,13 +959,14 @@ diff --git a/src/lib.rs b/src/lib.rs
             coverage,
             step: 0,
             mode: Mode::Steps,
+            show_notes: true,
             file_cache: HashMap::new(),
             strip_boxes: Vec::new(),
         }
     }
 
     fn screen(app: &mut App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 36)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
@@ -921,6 +988,7 @@ diff --git a/src/lib.rs b/src/lib.rs
                 line: 11,
                 text: "caller now owns it".into(),
             }],
+            speaker_notes: None,
         }]);
         let s = screen(&mut app);
         assert!(s.contains("▌"), "accent bar missing:\n{s}");
@@ -977,6 +1045,7 @@ diff --git a/f.rs b/f.rs
         let mut app = app_with(vec![Step::Cover {
             what: "What was done".into(),
             bullets: vec!["first".into(), "second".into()],
+            speaker_notes: None,
         }]);
         let s = screen(&mut app);
         assert!(s.contains("Test deck"), "{s}");
@@ -990,6 +1059,7 @@ diff --git a/f.rs b/f.rs
                 label: "core".into(),
                 files: vec!["src/".into()],
             }],
+            speaker_notes: None,
         }]);
         let s = screen(&mut app);
         assert!(s.contains("core"), "{s}");
@@ -1003,6 +1073,7 @@ diff --git a/f.rs b/f.rs
         let mut app = app_with(vec![Step::BeforeAfter {
             at: "src/lib.rs:11".parse().unwrap(),
             claim: None,
+            speaker_notes: None,
         }]);
         let s = screen(&mut app);
         assert!(s.contains("── before"), "{s}");
@@ -1018,6 +1089,7 @@ diff --git a/f.rs b/f.rs
             claim: "contract change".into(),
             severity: Severity::High,
             notes: vec![],
+            speaker_notes: None,
         }]);
         let s = screen(&mut app);
         assert!(s.contains(" high "), "{s}");
@@ -1030,6 +1102,7 @@ diff --git a/f.rs b/f.rs
             at: "src/lib.rs:11".parse().unwrap(),
             claim: "c".into(),
             notes: vec![],
+            speaker_notes: None,
         }]);
         app.mode = Mode::Dive { scroll: 0 };
         let s = screen(&mut app);
@@ -1039,16 +1112,46 @@ diff --git a/f.rs b/f.rs
     }
 
     #[test]
+    fn speaker_notes_show_below_the_slide_and_toggle_off() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "short claim".into(),
+            notes: vec![],
+            speaker_notes: Some("the long prose lands under the slide".into()),
+        }]);
+        let s = screen(&mut app);
+        assert!(s.contains("the long prose lands under the slide"), "{s}");
+        assert!(s.contains(" notes · s to hide "), "{s}");
+        app.show_notes = false;
+        let s = screen(&mut app);
+        assert!(!s.contains("long prose"), "notes should hide:\n{s}");
+    }
+
+    #[test]
+    fn page_is_slide_shaped_not_full_height() {
+        let mut app = app_with(vec![Step::Cover {
+            what: "w".into(),
+            bullets: vec![],
+            speaker_notes: None,
+        }]);
+        let s = screen(&mut app);
+        let first_border = s.lines().position(|l| l.contains("╭─")).unwrap();
+        assert!(first_border > 0, "page should not start at row 0:\n{s}");
+    }
+
+    #[test]
     fn clicking_a_filmstrip_box_jumps_to_that_step() {
         let mut app = app_with(vec![
             Step::Cover {
                 what: "w".into(),
                 bullets: vec![],
+                speaker_notes: None,
             },
             Step::Point {
                 at: "src/lib.rs:11".parse().unwrap(),
                 claim: "c".into(),
                 notes: vec![],
+                speaker_notes: None,
             },
         ]);
         screen(&mut app); // draw once to populate hit areas
@@ -1068,6 +1171,7 @@ diff --git a/f.rs b/f.rs
             at: "src/gone.rs:5".parse().unwrap(),
             claim: "c".into(),
             notes: vec![],
+            speaker_notes: None,
         }]);
         let s = screen(&mut app);
         assert!(s.contains("cannot read src/gone.rs"), "{s}");

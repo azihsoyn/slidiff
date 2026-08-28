@@ -11,7 +11,9 @@ on screen is always what is in the tree, never a copy that has drifted.
 Selection is forced, not requested. A claim is one line (≤80 chars), an excerpt
 is at most 16 lines, an explanation is a ≤48-char note attached to the exact
 line it is about. Pointing at a whole block, or writing a paragraph, does not
-fit the format and does not get written.
+fit the format and does not get written. The one place prose is allowed is
+`speaker_notes` (≤600 chars per step): shown below the slide, never on it,
+hidden with `s`.
 
 ## Use
 
@@ -44,6 +46,7 @@ steps:
     notes:
       - line: 142
         text: "this ordering is the whole fix"
+    speaker_notes: "Longer prose for the interested reader goes here, off-slide."
   - type: before_after # old and new side by side for the same range
     at: "src/session.rs:138-150"
   - type: risk

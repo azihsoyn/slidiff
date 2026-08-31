@@ -58,6 +58,7 @@ pub fn parse(text: &str) -> Result<Deck, Vec<String>> {
         let n = i + 1;
         let (body, speaker_notes) = split_notes(slide);
         let mut heading: Option<String> = None;
+        let mut heading_depth: usize = 0;
         let mut anchor_line: Option<String> = None;
         let mut is_map = false;
         let mut list_items: Vec<String> = Vec::new();
@@ -68,13 +69,14 @@ pub fn parse(text: &str) -> Result<Deck, Vec<String>> {
             if line.is_empty() {
                 continue;
             }
-            if let Some(rest) = heading_text(line) {
+            if let Some((depth, rest)) = heading_text(line) {
                 if heading.is_some() {
                     errors.push(format!(
                         "slide {n}: two headings — one claim per slide; move the rest below ???"
                     ));
                 }
                 heading = Some(rest.to_string());
+                heading_depth = depth;
             } else if line == "@map" || line == "@ map" {
                 is_map = true;
             } else if let Some(rest) = line.strip_prefix("@ ") {
@@ -114,6 +116,7 @@ pub fn parse(text: &str) -> Result<Deck, Vec<String>> {
             steps.push(Step::Cover {
                 what,
                 bullets: list_items,
+                level: 1,
                 speaker_notes,
             });
             continue;
@@ -147,7 +150,8 @@ pub fn parse(text: &str) -> Result<Deck, Vec<String>> {
         }
 
         let Some(anchor_line) = anchor_line else {
-            // Text slide: heading + bullets, rendered like the cover.
+            // Headline slide: heading depth nests it — `##` opens a
+            // section, `###` a subsection. Files make the third tier.
             let Some(heading) = heading else {
                 errors.push(format!(
                     "slide {n}: no heading and no @ anchor — a slide is a claim or a headline"
@@ -159,9 +163,16 @@ pub fn parse(text: &str) -> Result<Deck, Vec<String>> {
                     "slide {n}: prose on the slide — move it below ??? into speaker notes"
                 ));
             }
+            if heading_depth > 3 {
+                errors.push(format!(
+                    "slide {n}: `{}` heading — three tiers is the max (## section, ### subsection, files)",
+                    "#".repeat(heading_depth)
+                ));
+            }
             steps.push(Step::Cover {
                 what: heading,
                 bullets: list_items,
+                level: if heading_depth >= 3 { 2 } else { 1 },
                 speaker_notes,
             });
             continue;
@@ -287,12 +298,12 @@ fn split_notes(slide: &str) -> (String, Option<String>) {
     (body, notes)
 }
 
-fn heading_text(line: &str) -> Option<&str> {
+fn heading_text(line: &str) -> Option<(usize, &str)> {
     let hashes = line.chars().take_while(|c| *c == '#').count();
     if hashes == 0 || hashes > 6 {
         return None;
     }
-    line[hashes..].strip_prefix(' ').map(str::trim)
+    line[hashes..].strip_prefix(' ').map(|t| (hashes, t.trim()))
 }
 
 fn parse_note(item: &str) -> Option<Note> {
@@ -431,6 +442,40 @@ w
         assert!(errors.iter().any(|e| e.starts_with("slide 2: @")), "{errors:?}");
         assert!(
             errors.iter().any(|e| e.contains("unknown @ flag \"risk=extreme\"")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn heading_depth_nests_sections_and_refuses_a_fourth_tier() {
+        let text = "\
+# t
+
+w
+
+---
+
+## section
+
+---
+
+### subsection
+
+---
+
+## c
+@ a.rs:1-3
+";
+        let deck = parse(text).unwrap();
+        let Step::Cover { level, .. } = &deck.steps[1] else { panic!() };
+        assert_eq!(*level, 1);
+        let Step::Cover { level, .. } = &deck.steps[2] else { panic!() };
+        assert_eq!(*level, 2);
+
+        let too_deep = "# t\n\nw\n\n---\n\n#### nope\n";
+        let errors = parse(too_deep).unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("three tiers is the max")),
             "{errors:?}"
         );
     }

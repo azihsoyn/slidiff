@@ -60,7 +60,9 @@ pub struct Deck {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Step {
-    /// Title slide: what happened, in at most three bullets.
+    /// Title slide: what happened, in at most three bullets. Mid-deck,
+    /// a cover is a headline; `level` nests it (1 = section,
+    /// 2 = subsection — three tiers total counting files).
     Cover {
         /// One line stating what was done.
         #[schemars(length(max = 80))]
@@ -69,6 +71,10 @@ pub enum Step {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[schemars(length(max = 3), inner(length(max = 60)))]
         bullets: Vec<String>,
+        /// Headline nesting: 1 = section, 2 = subsection.
+        #[serde(default = "default_level")]
+        #[schemars(range(min = 1, max = 2))]
+        level: u8,
         /// Longer prose for the reader who wants the detail. Shown below
         /// the slide, never on it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,6 +128,10 @@ pub enum Step {
         #[schemars(length(max = 600))]
         speaker_notes: Option<String>,
     },
+}
+
+fn default_level() -> u8 {
+    1
 }
 
 /// One line of explanation attached to one line of code.
@@ -359,8 +369,14 @@ impl Deck {
                 }
             }
             match step {
-                Step::Cover { what, bullets, .. } => {
+                Step::Cover { what, bullets, level, .. } => {
                     check_len(&at("what"), what, MAX_CLAIM_CHARS, &mut errors);
+                    if !(1..=2).contains(level) {
+                        errors.push(format!(
+                            "{}: {level} — 1 (section) or 2 (subsection); three tiers is the max",
+                            at("level"),
+                        ));
+                    }
                     if bullets.len() > MAX_BULLETS {
                         errors.push(format!(
                             "{}: {} bullets, limit is {} — cut {}",
@@ -519,6 +535,7 @@ mod tests {
             steps: vec![Step::Cover {
                 what: "w".into(),
                 bullets: vec![],
+                level: 1,
                 speaker_notes: None,
             }],
         };

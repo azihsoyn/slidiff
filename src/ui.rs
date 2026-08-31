@@ -98,9 +98,12 @@ struct App {
 }
 
 /// A run of slides under one headline slide, and the files they point at.
+/// `level` 1 is a section, 2 a subsection; files under a headline make
+/// the third tier.
 struct Section {
     title: String,
     headline_step: usize,
+    level: u8,
     /// (path, first step that points at it)
     files: Vec<(String, usize)>,
 }
@@ -109,14 +112,16 @@ fn outline_of(deck: &Deck) -> Vec<Section> {
     let mut sections = vec![Section {
         title: String::new(),
         headline_step: 0,
+        level: 1,
         files: Vec::new(),
     }];
     for (i, step) in deck.steps.iter().enumerate() {
         if i > 0
-            && let Step::Cover { what, .. } = step {
+            && let Step::Cover { what, level, .. } = step {
                 sections.push(Section {
                     title: what.clone(),
                     headline_step: i,
+                    level: (*level).clamp(1, 2),
                     files: Vec::new(),
                 });
                 continue;
@@ -315,8 +320,14 @@ impl App {
                 }
                 // Fixed geometry, derived from the terminal size alone:
                 // the page never moves or resizes between slides.
-                let has_sections = self.outline.iter().any(|s| !s.title.is_empty());
-                let geo = Geometry::of(main, has_sections);
+                let band_rows = self
+                    .outline
+                    .iter()
+                    .filter(|s| !s.title.is_empty())
+                    .map(|s| s.level)
+                    .max()
+                    .unwrap_or(0) as u16;
+                let geo = Geometry::of(main, band_rows);
                 let [_, page_row, notes_row, _, strip] = Layout::vertical([
                     Constraint::Fill(1),
                     Constraint::Length(geo.page_h),
@@ -401,8 +412,17 @@ impl App {
         let total = (end - start) as u16 * pitch - 1;
         let x0 = area.x + area.width.saturating_sub(total) / 2;
         let boxes_y = area.y + area.height.saturating_sub(3);
-        if area.height >= 4 {
-            self.draw_section_bands(frame, area.y, x0, pitch, start, end);
+        let band_rows = area.height.saturating_sub(3);
+        for level in 1..=band_rows.min(2) {
+            self.draw_section_bands(
+                frame,
+                area.y + level - 1,
+                level as u8,
+                x0,
+                pitch,
+                start,
+                end,
+            );
         }
         for (j, i) in (start..end).enumerate() {
             let rect = Rect {
@@ -457,30 +477,45 @@ impl App {
         }
     }
 
-    /// The bands over the boxes: one per section, spanning its slides,
-    /// current section lit. `…` where the window cuts a section short.
+    /// One row of bands for headlines of `level`, spanning their slides,
+    /// current chain lit. `…` where the window cuts a band short.
     /// Clicking a band jumps to its headline slide.
+    #[allow(clippy::too_many_arguments)]
     fn draw_section_bands(
         &mut self,
         frame: &mut Frame,
         y: u16,
+        level: u8,
         x0: u16,
         pitch: u16,
         win_start: usize,
         win_end: usize,
     ) {
         let n = self.deck.steps.len();
-        let current_section = self
+        let cur_l1_step = self
             .outline
             .iter()
-            .rposition(|s| s.headline_step <= self.step);
+            .filter(|s| s.level == 1 && !s.title.is_empty() && s.headline_step <= self.step)
+            .map(|s| s.headline_step)
+            .next_back()
+            .unwrap_or(0);
+        // A subsection is only "current" inside the current section.
+        let current_section = self.outline.iter().rposition(|s| {
+            s.level == level
+                && !s.title.is_empty()
+                && s.headline_step <= self.step
+                && (level == 1 || s.headline_step >= cur_l1_step)
+        });
         for (si, section) in self.outline.iter().enumerate() {
-            if section.title.is_empty() {
+            if section.title.is_empty() || section.level != level {
                 continue;
             }
+            // A band runs until the next headline at its level or above.
             let sec_end = self
                 .outline
-                .get(si + 1)
+                .iter()
+                .skip(si + 1)
+                .find(|s| !s.title.is_empty() && s.level <= level)
                 .map(|s| s.headline_step)
                 .unwrap_or(n);
             let s = section.headline_step.max(win_start);
@@ -542,10 +577,17 @@ impl App {
         );
         let inner_w = usize::from(area.width.saturating_sub(2));
         let current_file = self.current().anchor().map(|a| a.file.clone());
-        let current_section = self
+        // Nearest headline at or before the current slide, and its parent
+        // section when the nearest one is a subsection.
+        let nearest = self
             .outline
             .iter()
-            .rposition(|s| s.headline_step <= self.step);
+            .rposition(|s| !s.title.is_empty() && s.headline_step <= self.step);
+        let parent = nearest.filter(|&i| self.outline[i].level == 2).and_then(|i| {
+            self.outline[..i]
+                .iter()
+                .rposition(|s| s.level == 1 && !s.title.is_empty())
+        });
 
         // (line, click target, is-current-file)
         let mut rows: Vec<(Line, Option<usize>, bool)> = Vec::new();
@@ -555,19 +597,33 @@ impl App {
             false,
         ));
         for (si, section) in self.outline.iter().enumerate() {
-            rows.push((Line::default(), None, false));
             if !section.title.is_empty() {
-                let style = if Some(si) == current_section {
+                if section.level == 1 {
+                    rows.push((Line::default(), None, false));
+                }
+                let style = if Some(si) == nearest {
                     Style::new().fg(ACCENT).bold()
-                } else {
+                } else if Some(si) == parent {
+                    Style::new().fg(ACCENT)
+                } else if section.level == 1 {
                     Style::new().bold()
+                } else {
+                    Style::new()
                 };
+                let indent = if section.level == 1 { " " } else { "   " };
                 rows.push((
-                    Line::from(format!(" {}", fit(&section.title, inner_w))).style(style),
+                    Line::from(format!(
+                        "{indent}{}",
+                        fit(&section.title, inner_w.saturating_sub(indent.len()))
+                    ))
+                    .style(style),
                     Some(section.headline_step),
                     false,
                 ));
+            } else {
+                rows.push((Line::default(), None, false));
             }
+            let file_indent = if section.level == 1 { "  " } else { "    " };
             for (path, first_step) in &section.files {
                 let is_current = current_file.as_deref() == Some(path.as_str());
                 let counts = file_diff(&self.files, path)
@@ -576,7 +632,7 @@ impl App {
                     Some((a, d)) => format!(" +{a} -{d}"),
                     None => String::new(),
                 };
-                let name_w = inner_w.saturating_sub(count_text.len() + 3);
+                let name_w = inner_w.saturating_sub(count_text.len() + file_indent.len() + 1);
                 let marker = if is_current { "▎" } else { " " };
                 let marker_style = if is_current {
                     Style::new().fg(ACCENT)
@@ -589,7 +645,7 @@ impl App {
                     Style::new()
                 };
                 let mut spans = vec![
-                    Span::raw("  "),
+                    Span::raw(file_indent.to_string()),
                     Span::styled(marker.to_string(), marker_style),
                     Span::styled(fit(path, name_w), name_style),
                 ];
@@ -1143,13 +1199,9 @@ struct Geometry {
 }
 
 impl Geometry {
-    fn of(area: Rect, has_sections: bool) -> Geometry {
-        // One extra strip row carries the section bands over the boxes.
-        let strip_h = if area.height >= 22 {
-            if has_sections { 4 } else { 3 }
-        } else {
-            0
-        };
+    fn of(area: Rect, band_rows: u16) -> Geometry {
+        // Extra strip rows carry the section/subsection bands over the boxes.
+        let strip_h = if area.height >= 22 { 3 + band_rows } else { 0 };
         let page_w = area.width.saturating_sub(10).clamp(20, 96);
         // 16:9-ish: terminal cells are ~1:2, so rows ≈ cols × 9⁄32.
         let mut page_h = ((u32::from(page_w) * 9 / 32) as u16).max(10);
@@ -1387,6 +1439,7 @@ diff --git a/f.rs b/f.rs
         let mut app = app_with(vec![Step::Cover {
             what: "What was done".into(),
             bullets: vec!["first".into(), "second".into()],
+            level: 1,
             speaker_notes: None,
         }]);
         let s = screen(&mut app);
@@ -1478,6 +1531,7 @@ diff --git a/f.rs b/f.rs
         let mut app = app_with(vec![Step::Cover {
             what: "w".into(),
             bullets: vec![],
+            level: 1,
             speaker_notes: None,
         }]);
         let s = screen(&mut app);
@@ -1521,11 +1575,13 @@ diff --git a/f.rs b/f.rs
             Step::Cover {
                 what: "w".into(),
                 bullets: vec![],
+                level: 1,
                 speaker_notes: None,
             },
             Step::Cover {
                 what: "section one".into(),
                 bullets: vec![],
+                level: 1,
                 speaker_notes: None,
             },
             Step::Point {
@@ -1585,11 +1641,13 @@ diff --git a/f.rs b/f.rs
             Step::Cover {
                 what: "w".into(),
                 bullets: vec![],
+                level: 1,
                 speaker_notes: None,
             },
             Step::Cover {
                 what: "part one".into(),
                 bullets: vec![],
+                level: 1,
                 speaker_notes: None,
             },
             point("a"),
@@ -1609,11 +1667,47 @@ diff --git a/f.rs b/f.rs
     }
 
     #[test]
+    fn subsections_indent_in_sidebar_and_get_their_own_band_row() {
+        let point = |claim: &str| Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: claim.into(),
+            notes: vec![],
+            speaker_notes: None,
+        };
+        let headline = |what: &str, level: u8| Step::Cover {
+            what: what.into(),
+            bullets: vec![],
+            level,
+            speaker_notes: None,
+        };
+        let mut app = app_with(vec![
+            headline("intro", 1),
+            headline("part one", 1),
+            headline("sub a", 2),
+            point("x"),
+            headline("sub b", 2),
+            point("y"),
+        ]);
+        app.step = 3; // inside sub a
+        let s = screen(&mut app);
+        assert!(s.contains("   sub a"), "indented subsection missing:\n{s}");
+        assert!(s.contains("╶ part one"), "level-1 band missing:\n{s}");
+        assert!(s.contains("╶ sub a"), "level-2 band missing:\n{s}");
+        // The level-2 band row sits below the level-1 band row.
+        let row_of = |needle: &str| s.lines().position(|l| l.contains(needle)).unwrap();
+        assert!(row_of("╶ part one") < row_of("╶ sub a"), "{s}");
+        // sub b has not started yet, so its band is not the lit one; its
+        // headline is still clickable via the strip.
+        assert!(app.strip_boxes.iter().any(|(_, t)| *t == 4));
+    }
+
+    #[test]
     fn clicking_a_filmstrip_box_jumps_to_that_step() {
         let mut app = app_with(vec![
             Step::Cover {
                 what: "w".into(),
                 bullets: vec![],
+                level: 1,
                 speaker_notes: None,
             },
             Step::Point {

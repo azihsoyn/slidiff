@@ -32,16 +32,20 @@ use crate::highlight::{Lang, highlight};
 pub fn run(deck: Deck, repo: Repo) -> Result<()> {
     let files = load_diff(&repo, deck.base.as_deref())?;
     let coverage = Coverage::compute(&deck, &files);
+    let outline = outline_of(&deck);
     let mut app = App {
         deck,
         repo,
         files,
         coverage,
+        outline,
         step: 0,
         mode: Mode::Steps,
         notes_view: NotesView::Panel,
+        files_view: true,
         file_cache: HashMap::new(),
         strip_boxes: Vec::new(),
+        sidebar_hits: Vec::new(),
     };
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
@@ -82,9 +86,50 @@ struct App {
     step: usize,
     mode: Mode,
     notes_view: NotesView,
+    /// File sidebar on the left, toggled with `f`; hidden on narrow panes.
+    files_view: bool,
+    /// The deck's sections and the files each one points at.
+    outline: Vec<Section>,
     file_cache: HashMap<String, Option<Vec<String>>>,
     /// Filmstrip hit areas, refreshed on every draw: (box, step index).
     strip_boxes: Vec<(Rect, usize)>,
+    /// Sidebar hit areas, refreshed on every draw: (row, step index).
+    sidebar_hits: Vec<(Rect, usize)>,
+}
+
+/// A run of slides under one headline slide, and the files they point at.
+struct Section {
+    title: String,
+    headline_step: usize,
+    /// (path, first step that points at it)
+    files: Vec<(String, usize)>,
+}
+
+fn outline_of(deck: &Deck) -> Vec<Section> {
+    let mut sections = vec![Section {
+        title: String::new(),
+        headline_step: 0,
+        files: Vec::new(),
+    }];
+    for (i, step) in deck.steps.iter().enumerate() {
+        if i > 0
+            && let Step::Cover { what, .. } = step {
+                sections.push(Section {
+                    title: what.clone(),
+                    headline_step: i,
+                    files: Vec::new(),
+                });
+                continue;
+            }
+        if let Some(at) = step.anchor() {
+            let section = sections.last_mut().unwrap();
+            if !section.files.iter().any(|(f, _)| f == &at.file) {
+                section.files.push((at.file.clone(), i));
+            }
+        }
+    }
+    sections.retain(|s| !s.files.is_empty() || !s.title.is_empty());
+    sections
 }
 
 const ACCENT: Color = Color::Cyan;
@@ -155,6 +200,12 @@ impl Coverage {
             self.lines_touched, self.lines_total, self.files_touched, self.files_total
         )
     }
+
+    /// Compact form for the status bar; the file breakdown lives in the
+    /// sidebar and on the map slide.
+    fn summary_short(&self) -> String {
+        format!("covers +{}/+{}", self.lines_touched, self.lines_total)
+    }
 }
 
 impl App {
@@ -202,6 +253,7 @@ impl App {
                         self.step = self.step.saturating_sub(1);
                     }
                     KeyCode::Char('s') => self.notes_view = self.notes_view.next(),
+                    KeyCode::Char('f') => self.files_view = !self.files_view,
                     KeyCode::Enter => self.mode = Mode::Dive { scroll: 0 },
                     KeyCode::Esc => {
                         if self.notes_view == NotesView::Popup {
@@ -244,18 +296,34 @@ impl App {
         match self.mode {
             Mode::Steps => {
                 let area = frame.area();
+                let [content, status] =
+                    Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+                let sidebar_w = if self.files_view && content.width >= 100 {
+                    34
+                } else {
+                    0
+                };
+                let [side, main] = Layout::horizontal([
+                    Constraint::Length(sidebar_w),
+                    Constraint::Min(1),
+                ])
+                .areas(content);
+                if sidebar_w > 0 {
+                    self.draw_sidebar(frame, side);
+                } else {
+                    self.sidebar_hits.clear();
+                }
                 // Fixed geometry, derived from the terminal size alone:
                 // the page never moves or resizes between slides.
-                let geo = Geometry::of(area);
-                let [_, page_row, notes_row, _, strip, status] = Layout::vertical([
+                let geo = Geometry::of(main);
+                let [_, page_row, notes_row, _, strip] = Layout::vertical([
                     Constraint::Fill(1),
                     Constraint::Length(geo.page_h),
                     Constraint::Length(geo.notes_h),
                     Constraint::Fill(2),
                     Constraint::Length(geo.strip_h),
-                    Constraint::Length(1),
                 ])
-                .areas(area);
+                .areas(main);
                 let page = center_h(page_row, geo.page_w);
                 frame.render_widget(
                     Block::bordered()
@@ -302,11 +370,11 @@ impl App {
         if let Some(at) = step.anchor() {
             left.push_str(&format!(" · {at}"));
         }
-        left.push_str(&format!(" · {}", self.coverage.summary()));
-        let right = "n next · p prev · s notes · enter diff · q quit ";
+        left.push_str(&format!(" · {}", self.coverage.summary_short()));
+        let right = "n/p move · s notes · f files · enter diff · q quit ";
         let [l, r] = Layout::horizontal([
             Constraint::Min(1),
-            Constraint::Length(right.len() as u16),
+            Constraint::Length(display_width(right) as u16),
         ])
         .areas(area);
         frame.render_widget(Paragraph::new(left).style(Style::new().dim()), l);
@@ -317,110 +385,68 @@ impl App {
     /// reader keeps in the corner of their eye. Clicking a box jumps there.
     fn draw_filmstrip(&mut self, frame: &mut Frame, area: Rect) {
         self.strip_boxes.clear();
-        let n = self.deck.steps.len() as u16;
-        let box_w: u16 = 6;
-        let total = n * (box_w + 1) - 1;
-        if area.width >= total {
-            let x0 = area.x + (area.width - total) / 2;
-            for i in 0..self.deck.steps.len() {
-                let rect = Rect {
-                    x: x0 + i as u16 * (box_w + 1),
-                    y: area.y,
-                    width: box_w,
-                    height: 3,
-                };
-                self.strip_boxes.push((rect, i));
-                let current = i == self.step;
-                let style = if current {
-                    Style::new().fg(ACCENT).bold()
-                } else {
-                    Style::new().dim()
-                };
-                frame.render_widget(
-                    Block::bordered()
-                        .border_type(BorderType::Rounded)
-                        .border_style(style),
-                    rect,
-                );
-                frame.render_widget(
-                    Paragraph::new(format!("{}", i + 1)).centered().style(style),
-                    rect.inner(Margin {
-                        horizontal: 1,
-                        vertical: 1,
-                    }),
-                );
-            }
+        let n = self.deck.steps.len();
+        let pitch: u16 = 7; // box width 6 + gap 1
+        let max_boxes = usize::from((area.width.saturating_sub(4) + 1) / pitch).max(1);
+        let (start, end) = if n <= max_boxes {
+            (0, n)
         } else {
-            // Denser fallbacks: numbered chips, then one dot per slide,
-            // then a dot window sliding around the current slide.
-            let n = self.deck.steps.len();
-            let labels: Vec<String> = (1..=n).map(|i| format!(" {i} ")).collect();
-            let chips_total: u16 = labels.iter().map(|l| l.len() as u16).sum();
-            let dots = chips_total > area.width;
-            let (win_start, win_end) = if !dots || n as u16 <= area.width.saturating_sub(4) {
-                (0, n)
+            let s = self
+                .step
+                .saturating_sub(max_boxes / 2)
+                .min(n - max_boxes);
+            (s, s + max_boxes)
+        };
+        let total = (end - start) as u16 * pitch - 1;
+        let x0 = area.x + area.width.saturating_sub(total) / 2;
+        for (j, i) in (start..end).enumerate() {
+            let rect = Rect {
+                x: x0 + j as u16 * pitch,
+                y: area.y,
+                width: 6,
+                height: 3,
+            };
+            self.strip_boxes.push((rect, i));
+            let style = if i == self.step {
+                Style::new().fg(ACCENT).bold()
             } else {
-                let visible = usize::from(area.width.saturating_sub(4).max(10));
-                let start = self
-                    .step
-                    .saturating_sub(visible / 2)
-                    .min(n.saturating_sub(visible));
-                (start, start + visible)
+                Style::new().dim()
             };
-            let ellipsis = |shown: bool| {
-                shown.then(|| Span::styled("… ".to_string(), Style::new().dim()))
-            };
-            let total: u16 = if dots {
-                (win_end - win_start) as u16
-                    + if win_start > 0 { 2 } else { 0 }
-                    + if win_end < n { 2 } else { 0 }
-            } else {
-                chips_total
-            };
-            let y = area.y + area.height / 2;
-            let mut x = area.x + area.width.saturating_sub(total) / 2;
-            let mut spans = Vec::new();
-            if dots
-                && let Some(e) = ellipsis(win_start > 0) {
-                    spans.push(e);
-                    x += 2;
-                }
-            for (i, label) in labels.iter().enumerate().take(win_end).skip(win_start) {
-                let (text, w) = if dots {
-                    (if i == self.step { "●" } else { "·" }.to_string(), 1)
-                } else {
-                    (label.clone(), label.len() as u16)
-                };
-                self.strip_boxes.push((
-                    Rect {
-                        x,
-                        y,
-                        width: w,
-                        height: 1,
-                    },
-                    i,
-                ));
-                x += w;
-                if i == self.step {
-                    let style = if dots {
-                        Style::new().fg(ACCENT).bold()
-                    } else {
-                        Style::new().fg(Color::Black).bg(ACCENT)
-                    };
-                    spans.push(Span::styled(text, style));
-                } else {
-                    spans.push(Span::styled(text, Style::new().dim()));
-                }
-            }
-            if dots && win_end < n {
-                spans.push(Span::styled(" …".to_string(), Style::new().dim()));
-            }
             frame.render_widget(
-                Paragraph::new(Line::from(spans)).centered(),
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(style),
+                rect,
+            );
+            frame.render_widget(
+                Paragraph::new(format!("{}", i + 1)).centered().style(style),
+                rect.inner(Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                }),
+            );
+        }
+        // Continuation marks when the window does not reach an end.
+        let mid_y = area.y + 1;
+        if start > 0 && x0 >= area.x + 2 {
+            frame.render_widget(
+                Paragraph::new("…").style(Style::new().dim()),
                 Rect {
-                    y,
+                    x: x0 - 2,
+                    y: mid_y,
+                    width: 1,
                     height: 1,
-                    ..area
+                },
+            );
+        }
+        if end < n {
+            frame.render_widget(
+                Paragraph::new("…").style(Style::new().dim()),
+                Rect {
+                    x: (x0 + total + 1).min(area.x + area.width - 1),
+                    y: mid_y,
+                    width: 1,
+                    height: 1,
                 },
             );
         }
@@ -434,9 +460,128 @@ impl App {
         if let Some(&(_, step)) = self
             .strip_boxes
             .iter()
+            .chain(self.sidebar_hits.iter())
             .find(|(rect, _)| rect.contains(pos))
         {
             self.step = step;
+        }
+    }
+
+    /// The changed-files panel: the deck's sections with the files each one
+    /// points at, GitHub-files-tab style. Clicking a row jumps to the first
+    /// slide about that file.
+    fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
+        self.sidebar_hits.clear();
+        frame.render_widget(
+            Block::new()
+                .borders(ratatui::widgets::Borders::RIGHT)
+                .border_style(Style::new().dim()),
+            area,
+        );
+        let inner_w = usize::from(area.width.saturating_sub(2));
+        let current_file = self.current().anchor().map(|a| a.file.clone());
+        let current_section = self
+            .outline
+            .iter()
+            .rposition(|s| s.headline_step <= self.step);
+
+        // (line, click target, is-current-file)
+        let mut rows: Vec<(Line, Option<usize>, bool)> = Vec::new();
+        rows.push((
+            Line::from(" files".to_string()).style(Style::new().dim()),
+            None,
+            false,
+        ));
+        for (si, section) in self.outline.iter().enumerate() {
+            rows.push((Line::default(), None, false));
+            if !section.title.is_empty() {
+                let style = if Some(si) == current_section {
+                    Style::new().fg(ACCENT).bold()
+                } else {
+                    Style::new().bold()
+                };
+                rows.push((
+                    Line::from(format!(" {}", fit(&section.title, inner_w))).style(style),
+                    Some(section.headline_step),
+                    false,
+                ));
+            }
+            for (path, first_step) in &section.files {
+                let is_current = current_file.as_deref() == Some(path.as_str());
+                let counts = file_diff(&self.files, path)
+                    .map(|fd| (fd.added(), fd.deleted()));
+                let count_text = match counts {
+                    Some((a, d)) => format!(" +{a} -{d}"),
+                    None => String::new(),
+                };
+                let name_w = inner_w.saturating_sub(count_text.len() + 3);
+                let marker = if is_current { "▎" } else { " " };
+                let marker_style = if is_current {
+                    Style::new().fg(ACCENT)
+                } else {
+                    Style::new()
+                };
+                let name_style = if is_current {
+                    Style::new().bold()
+                } else {
+                    Style::new()
+                };
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled(marker.to_string(), marker_style),
+                    Span::styled(fit(path, name_w), name_style),
+                ];
+                if let Some((a, d)) = counts {
+                    spans.push(Span::styled(format!(" +{a}"), Style::new().green().dim()));
+                    spans.push(Span::styled(format!(" -{d}"), Style::new().red().dim()));
+                }
+                rows.push((Line::from(spans), Some(*first_step), is_current));
+            }
+        }
+        if !self.coverage.untouched_top.is_empty() || self.coverage.files_touched < self.coverage.files_total {
+            let rest = self.coverage.files_total - self.coverage.files_touched;
+            rows.push((Line::default(), None, false));
+            rows.push((
+                Line::from(format!(" not in deck: {rest} files"))
+                    .style(Style::new().dim().italic()),
+                None,
+                false,
+            ));
+        }
+
+        // Keep the current file's row in view.
+        let height = usize::from(area.height);
+        let focus = rows
+            .iter()
+            .position(|(_, _, cur)| *cur)
+            .unwrap_or(0);
+        let offset = if rows.len() <= height {
+            0
+        } else {
+            focus.saturating_sub(height / 2).min(rows.len() - height)
+        };
+        for (i, (line, target, _)) in rows.into_iter().enumerate().skip(offset).take(height) {
+            let y = area.y + (i - offset) as u16;
+            if let Some(step) = target {
+                self.sidebar_hits.push((
+                    Rect {
+                        x: area.x,
+                        y,
+                        width: area.width.saturating_sub(1),
+                        height: 1,
+                    },
+                    step,
+                ));
+            }
+            frame.render_widget(
+                Paragraph::new(line),
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width.saturating_sub(1),
+                    height: 1,
+                },
+            );
         }
     }
 
@@ -898,6 +1043,26 @@ fn tint_span<'a>(text: String, base: Style, emph: bool, bg: Color, emph_bg: Colo
     }
 }
 
+/// Truncate from the left, keeping the tail (the basename side of a path),
+/// with a leading ellipsis when cut.
+fn fit(s: &str, max: usize) -> String {
+    if display_width(s) <= max {
+        return s.to_string();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut w = 1;
+    for c in s.chars().rev() {
+        let cw = if (c as u32) > 0x1100 { 2 } else { 1 };
+        if w + cw > max {
+            break;
+        }
+        w += cw;
+        tail.push(c);
+    }
+    let tail: String = tail.into_iter().rev().collect();
+    format!("…{tail}")
+}
+
 /// Rough display width: wide for CJK, 1 otherwise. Good enough for layout.
 fn display_width(s: &str) -> usize {
     s.chars()
@@ -1056,8 +1221,12 @@ diff --git a/src/lib.rs b/src/lib.rs
             steps,
         };
         let coverage = Coverage::compute(&deck, &files);
+        let outline = outline_of(&deck);
         App {
             deck,
+            outline,
+            files_view: true,
+            sidebar_hits: Vec::new(),
             repo: Repo {
                 root: PathBuf::from("/nonexistent"),
             },
@@ -1277,6 +1446,64 @@ diff --git a/f.rs b/f.rs
         app.notes_view = NotesView::Hidden;
         let third = page_top(&screen(&mut app));
         assert_eq!(first, third, "page moved when notes toggled");
+    }
+
+    #[test]
+    fn sidebar_lists_section_files_and_click_jumps() {
+        let mut app = app_with(vec![
+            Step::Cover {
+                what: "w".into(),
+                bullets: vec![],
+                speaker_notes: None,
+            },
+            Step::Cover {
+                what: "section one".into(),
+                bullets: vec![],
+                speaker_notes: None,
+            },
+            Step::Point {
+                at: "src/lib.rs:11".parse().unwrap(),
+                claim: "c".into(),
+                notes: vec![],
+                speaker_notes: None,
+            },
+        ]);
+        let s = screen(&mut app);
+        assert!(s.contains(" files"), "sidebar header missing:\n{s}");
+        assert!(s.contains("section one"), "section title missing:\n{s}");
+        assert!(s.contains("src/lib.rs +1 -1"), "file row missing:\n{s}");
+        let (rect, target) = *app
+            .sidebar_hits
+            .iter()
+            .find(|(_, t)| *t == 2)
+            .expect("file row hit area");
+        app.on_click(rect.x + 2, rect.y);
+        assert_eq!(app.step, target);
+
+        app.files_view = false;
+        let s = screen(&mut app);
+        assert!(!s.contains("src/lib.rs +1 -1"), "sidebar should hide:\n{s}");
+    }
+
+    #[test]
+    fn filmstrip_windows_around_current_for_long_decks() {
+        let steps: Vec<Step> = (0..60)
+            .map(|_| Step::Point {
+                at: "src/lib.rs:11".parse().unwrap(),
+                claim: "c".into(),
+                notes: vec![],
+                speaker_notes: None,
+            })
+            .collect();
+        let mut app = app_with(steps);
+        app.step = 30;
+        let s = screen(&mut app);
+        assert!(s.contains("31"), "current box missing:\n{s}");
+        assert!(s.contains("…"), "continuation marks missing:\n{s}");
+        assert!(!s.contains("│ 1 │"), "far-away boxes should be off-window");
+        // Every visible box is a click target.
+        assert!(!app.strip_boxes.is_empty());
+        assert!(app.strip_boxes.iter().any(|(_, i)| *i == 30));
     }
 
     #[test]

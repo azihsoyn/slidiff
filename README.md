@@ -13,9 +13,10 @@ is at most 16 lines, an explanation is a ≤48-char note attached to the exact
 line it is about. Pointing at a whole block, or writing a paragraph, does not
 fit the format and does not get written. The one place prose is allowed is
 speaker notes (≤600 chars per step): shown below the slide, never on it,
-cycled with `s` (panel → popup → hidden). A deck holds up to 40 steps — each
-slide stays one claim, but deck length scales with the change, and the status
-bar always reports how much of the diff the deck actually covers.
+cycled with `s` (panel → popup → hidden). Deck length is unbounded — every
+limit lives on the slide, not on the deck. A slide is one claim; how many
+claims a change needs is the change's business, and the status bar always
+reports how much of the diff the deck actually covers.
 
 ## Use
 

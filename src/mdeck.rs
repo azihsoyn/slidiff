@@ -396,15 +396,23 @@ this prose does not belong here
 
     #[test]
     fn schema_limits_apply_to_markdown_too() {
-        let mut text = String::from("# t\n\nw\n");
-        for i in 0..41 {
-            text.push_str(&format!("\n---\n\n## slide {i}\n@ a.rs:1-3\n"));
-        }
+        let long_claim = "c".repeat(90);
+        let text = format!("# t\n\nw\n\n---\n\n## {long_claim}\n@ a.rs:1-3\n");
         let errors = parse(&text).unwrap_err();
         assert!(
-            errors.iter().any(|e| e.contains("merge or cut")),
+            errors.iter().any(|e| e.contains("limit is 80 — cut 10")),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn deck_length_is_unbounded_in_markdown() {
+        let mut text = String::from("# t\n\nw\n");
+        for i in 0..120 {
+            text.push_str(&format!("\n---\n\n## slide {i}\n@ a.rs:1-3\n"));
+        }
+        let deck = parse(&text).unwrap();
+        assert_eq!(deck.steps.len(), 121);
     }
 
     #[test]

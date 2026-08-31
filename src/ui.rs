@@ -351,20 +351,41 @@ impl App {
                 );
             }
         } else {
-            // Denser fallbacks: numbered chips, then one dot per slide.
-            let labels: Vec<String> =
-                (1..=self.deck.steps.len()).map(|i| format!(" {i} ")).collect();
+            // Denser fallbacks: numbered chips, then one dot per slide,
+            // then a dot window sliding around the current slide.
+            let n = self.deck.steps.len();
+            let labels: Vec<String> = (1..=n).map(|i| format!(" {i} ")).collect();
             let chips_total: u16 = labels.iter().map(|l| l.len() as u16).sum();
             let dots = chips_total > area.width;
-            let total = if dots {
-                self.deck.steps.len() as u16
+            let (win_start, win_end) = if !dots || n as u16 <= area.width.saturating_sub(4) {
+                (0, n)
+            } else {
+                let visible = usize::from(area.width.saturating_sub(4).max(10));
+                let start = self
+                    .step
+                    .saturating_sub(visible / 2)
+                    .min(n.saturating_sub(visible));
+                (start, start + visible)
+            };
+            let ellipsis = |shown: bool| {
+                shown.then(|| Span::styled("… ".to_string(), Style::new().dim()))
+            };
+            let total: u16 = if dots {
+                (win_end - win_start) as u16
+                    + if win_start > 0 { 2 } else { 0 }
+                    + if win_end < n { 2 } else { 0 }
             } else {
                 chips_total
             };
             let y = area.y + area.height / 2;
             let mut x = area.x + area.width.saturating_sub(total) / 2;
             let mut spans = Vec::new();
-            for (i, label) in labels.iter().enumerate() {
+            if dots
+                && let Some(e) = ellipsis(win_start > 0) {
+                    spans.push(e);
+                    x += 2;
+                }
+            for (i, label) in labels.iter().enumerate().take(win_end).skip(win_start) {
                 let (text, w) = if dots {
                     (if i == self.step { "●" } else { "·" }.to_string(), 1)
                 } else {
@@ -390,6 +411,9 @@ impl App {
                 } else {
                     spans.push(Span::styled(text, Style::new().dim()));
                 }
+            }
+            if dots && win_end < n {
+                spans.push(Span::styled(" …".to_string(), Style::new().dim()));
             }
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).centered(),

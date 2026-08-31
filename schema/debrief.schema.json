@@ -245,11 +245,10 @@
       ]
     },
     "steps": {
-      "description": "The slides. At most 40 — the schema refuses more.",
+      "description": "The slides. As many as the change needs — length limits live on\neach slide, not on the deck.",
       "items": {
         "$ref": "#/$defs/Step"
       },
-      "maxItems": 40,
       "minItems": 1,
       "type": "array"
     },

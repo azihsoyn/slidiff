@@ -15,11 +15,9 @@ use std::str::FromStr;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
-/// A deck may not exceed this many steps. Per-slide limits keep each
-/// screen readable; deck length is allowed to scale with the change —
-/// a 12k-line branch legitimately needs dozens of stops, and the
-/// filmstrip plus the coverage meter keep a long deck navigable.
-pub const MAX_STEPS: usize = 40;
+// Deck length is deliberately unbounded: per-slide limits keep each
+// screen readable, and deck length scales with the change it reports.
+// The filmstrip and the coverage meter keep a long deck navigable.
 /// A claim is one short line above the code, not a paragraph.
 pub const MAX_CLAIM_CHARS: usize = 80;
 /// A note hangs off a single line; it must fit next to code.
@@ -53,8 +51,9 @@ pub struct Deck {
     /// uncommitted changes against the last commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
-    /// The slides. At most 40 — the schema refuses more.
-    #[schemars(length(min = 1, max = 40))]
+    /// The slides. As many as the change needs — length limits live on
+    /// each slide, not on the deck.
+    #[schemars(length(min = 1))]
     pub steps: Vec<Step>,
 }
 
@@ -319,14 +318,6 @@ impl Deck {
         if self.steps.is_empty() {
             errors.push("steps: empty — a deck needs at least one step".to_string());
         }
-        if self.steps.len() > MAX_STEPS {
-            errors.push(format!(
-                "steps: {} steps, limit is {} — merge or cut {}",
-                self.steps.len(),
-                MAX_STEPS,
-                self.steps.len() - MAX_STEPS
-            ));
-        }
 
         for (i, step) in self.steps.iter().enumerate() {
             let at = |field: &str| format!("steps[{i}] ({}).{field}", step.type_name());
@@ -535,15 +526,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_refuses_thirteenth_step_and_empty_map() {
+    fn deck_length_is_unbounded_but_empty_map_is_refused() {
         let step = Step::Map { groups: vec![], speaker_notes: None };
         let deck = Deck {
             title: "t".into(),
             base: None,
-            steps: vec![step; 41],
+            steps: vec![step; 200],
         };
         let errors = deck.validate();
-        assert!(errors.iter().any(|e| e.contains("merge or cut 1")));
+        assert!(
+            !errors.iter().any(|e| e.contains("steps:")),
+            "no per-deck length error expected: {errors:?}"
+        );
         assert!(errors.iter().any(|e| e.contains("name at least one group")));
     }
 }

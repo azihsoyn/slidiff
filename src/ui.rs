@@ -351,14 +351,25 @@ impl App {
                 );
             }
         } else {
+            // Denser fallbacks: numbered chips, then one dot per slide.
             let labels: Vec<String> =
                 (1..=self.deck.steps.len()).map(|i| format!(" {i} ")).collect();
-            let total: u16 = labels.iter().map(|l| l.len() as u16).sum();
+            let chips_total: u16 = labels.iter().map(|l| l.len() as u16).sum();
+            let dots = chips_total > area.width;
+            let total = if dots {
+                self.deck.steps.len() as u16
+            } else {
+                chips_total
+            };
             let y = area.y + area.height / 2;
             let mut x = area.x + area.width.saturating_sub(total) / 2;
             let mut spans = Vec::new();
             for (i, label) in labels.iter().enumerate() {
-                let w = label.len() as u16;
+                let (text, w) = if dots {
+                    (if i == self.step { "●" } else { "·" }.to_string(), 1)
+                } else {
+                    (label.clone(), label.len() as u16)
+                };
                 self.strip_boxes.push((
                     Rect {
                         x,
@@ -370,12 +381,14 @@ impl App {
                 ));
                 x += w;
                 if i == self.step {
-                    spans.push(Span::styled(
-                        label.clone(),
-                        Style::new().fg(Color::Black).bg(ACCENT),
-                    ));
+                    let style = if dots {
+                        Style::new().fg(ACCENT).bold()
+                    } else {
+                        Style::new().fg(Color::Black).bg(ACCENT)
+                    };
+                    spans.push(Span::styled(text, style));
                 } else {
-                    spans.push(Span::styled(label.clone(), Style::new().dim()));
+                    spans.push(Span::styled(text, Style::new().dim()));
                 }
             }
             frame.render_widget(

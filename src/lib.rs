@@ -3,6 +3,7 @@ pub mod diff;
 pub mod highlight;
 pub mod md;
 pub mod mdeck;
+pub mod resume;
 pub mod seen;
 pub mod ui;
 

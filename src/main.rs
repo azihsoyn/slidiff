@@ -88,6 +88,10 @@ fn cmd_view(path: &Path) -> Result<ExitCode> {
     }
     let cwd = std::env::current_dir().context("cannot read current dir")?;
     let repo = slidiff::diff::Repo::discover(&cwd)?;
-    slidiff::ui::run(deck, repo)?;
+    let deck_key = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    slidiff::ui::run(deck, repo, Some(deck_key))?;
     Ok(ExitCode::SUCCESS)
 }

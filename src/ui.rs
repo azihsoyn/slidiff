@@ -30,18 +30,24 @@ use crate::diff::{
 use crate::highlight::{Lang, highlight};
 use crate::seen::{SeenStore, changed_count, hunk_hash};
 
-pub fn run(deck: Deck, repo: Repo) -> Result<()> {
+pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
     let files = load_diff(&repo, deck.base.as_deref())?;
     let coverage = Coverage::compute(&deck, &files);
     let outline = outline_of(&deck);
-    let seen = SeenStore::load(repo.git_dir());
+    let git_dir = repo.git_dir();
+    let seen = SeenStore::load(git_dir.clone());
+    // Pick up where the reader left off last time.
+    let resumed = deck_key
+        .as_deref()
+        .and_then(|key| crate::resume::load(&git_dir, key))
+        .filter(|&s| s > 0 && s < deck.steps.len());
     let mut app = App {
         deck,
         repo,
         files,
         coverage,
         outline,
-        step: 0,
+        step: resumed.unwrap_or(0),
         mode: Mode::Steps,
         notes_view: NotesView::Panel,
         files_view: true,
@@ -53,11 +59,13 @@ pub fn run(deck: Deck, repo: Repo) -> Result<()> {
         focus: Focus::Slides,
         ask: None,
         help: false,
-        toast: None,
+        toast: resumed.map(|s| format!("resumed at slide {}", s + 1)),
         sidebar_cursor: 0,
         sidebar_items: Vec::new(),
         strip_boxes: Vec::new(),
         sidebar_hits: Vec::new(),
+        git_dir,
+        deck_key,
     };
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
@@ -153,6 +161,9 @@ struct App {
     strip_boxes: Vec<(Rect, usize)>,
     /// Sidebar hit areas, refreshed on every draw.
     sidebar_hits: Vec<(Rect, SideTarget)>,
+    git_dir: Option<std::path::PathBuf>,
+    /// Identity of the open deck, for the resume record.
+    deck_key: Option<String>,
 }
 
 /// A run of slides under one headline slide, and the files they point at.
@@ -273,7 +284,16 @@ impl Coverage {
 
 impl App {
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let mut saved_step = self.step;
         loop {
+            // Persist the position whenever it moved, so a reopened deck
+            // starts where this one left off.
+            if self.step != saved_step {
+                saved_step = self.step;
+                if let Some(key) = &self.deck_key {
+                    crate::resume::save(&self.git_dir, key, self.step);
+                }
+            }
             terminal.draw(|frame| self.draw(frame))?;
             let key = match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => key,
@@ -2076,6 +2096,8 @@ diff --git a/src/lib.rs b/src/lib.rs
             sidebar_cursor: 0,
             sidebar_items: Vec::new(),
             strip_boxes: Vec::new(),
+            git_dir: None,
+            deck_key: None,
         }
     }
 

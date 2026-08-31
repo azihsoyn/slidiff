@@ -52,6 +52,19 @@ impl SeenStore {
         }
     }
 
+    /// Toggle a specific set of changed lines — e.g. the ones a slide's
+    /// excerpt shows. Completes first: if any are unseen, mark them all;
+    /// only a fully seen set toggles off. Returns the new state.
+    pub fn toggle_lines(&mut self, file: &str, lines: &[(String, usize)]) -> bool {
+        let all_seen = lines
+            .iter()
+            .all(|(hash, idx)| self.0.is_seen(file, hash, *idx));
+        for (hash, idx) in lines {
+            self.0.set_line(file, hash, *idx, !all_seen);
+        }
+        !all_seen
+    }
+
     /// (seen, total) changed lines for one file, counting only marks whose
     /// hunk hash still exists in the current diff.
     pub fn progress_for(&self, fd: &FileDiff) -> (usize, usize) {

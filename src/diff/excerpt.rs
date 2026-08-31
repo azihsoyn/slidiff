@@ -13,6 +13,12 @@ pub struct ExcerptRow {
     pub new_no: Option<u32>,
     /// Word-level emphasis, present when this row is part of a del/add pair.
     pub segments: Option<Vec<Segment>>,
+    /// Which hunk of the file diff this row came from; None for rows read
+    /// straight from the worktree file.
+    pub hunk_idx: Option<usize>,
+    /// This row's index among its hunk's changed lines — the address the
+    /// seen record uses. None for context rows.
+    pub changed_idx: Option<usize>,
 }
 
 /// The rows to display for new-side lines `start..=end`.
@@ -40,7 +46,7 @@ pub fn excerpt(
     let mut at_line: Vec<Option<ExcerptRow>> = vec![None; (end - start + 1) as usize];
     let mut dels_before: Vec<Vec<ExcerptRow>> = vec![Vec::new(); (end - start + 2) as usize];
 
-    for hunk in fd.map(|f| f.hunks.as_slice()).unwrap_or_default() {
+    for (hunk_idx, hunk) in fd.map(|f| f.hunks.as_slice()).unwrap_or_default().iter().enumerate() {
         if !overlaps(hunk, start, end) {
             continue;
         }
@@ -48,7 +54,13 @@ pub fn excerpt(
         // Where a deletion "is" on the new side: after the previous line
         // that still exists there.
         let mut next_new = hunk.new_start;
+        let mut changed_idx = 0usize;
         for (line, seg) in hunk.lines.iter().zip(segs) {
+            let this_changed = (line.kind != LineKind::Context).then(|| {
+                let i = changed_idx;
+                changed_idx += 1;
+                i
+            });
             match line.kind {
                 LineKind::Context | LineKind::Add => {
                     let no = line.new_no.expect("context/add lines carry new_no");
@@ -59,6 +71,8 @@ pub fn excerpt(
                             text: line.text.clone(),
                             new_no: Some(no),
                             segments: (line.kind == LineKind::Add).then_some(seg),
+                            hunk_idx: Some(hunk_idx),
+                            changed_idx: this_changed,
                         });
                     }
                 }
@@ -69,6 +83,8 @@ pub fn excerpt(
                             text: line.text.clone(),
                             new_no: None,
                             segments: Some(seg),
+                            hunk_idx: Some(hunk_idx),
+                            changed_idx: this_changed,
                         });
                     }
                 }
@@ -88,6 +104,8 @@ pub fn excerpt(
                         text: text.clone(),
                         new_no: Some(no),
                         segments: None,
+                        hunk_idx: None,
+                        changed_idx: None,
                     });
                 }
             }
@@ -144,6 +162,13 @@ diff --git a/f.rs b/f.rs
         assert!(rows[2].new_no.is_none());
         assert_eq!(rows[3].new_no, Some(11));
         assert!(rows[3].segments.is_some());
+        // Provenance: gap rows come from the file, hunk rows carry their
+        // hunk and changed-line address.
+        assert_eq!(rows[0].hunk_idx, None);
+        assert_eq!(rows[2].changed_idx, Some(0));
+        assert_eq!(rows[3].changed_idx, Some(1));
+        assert_eq!(rows[3].hunk_idx, Some(0));
+        assert_eq!(rows[4].changed_idx, None);
     }
 
     #[test]

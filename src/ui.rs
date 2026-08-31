@@ -373,6 +373,7 @@ impl App {
                     }
                     KeyCode::Char('s') => self.notes_view = self.notes_view.next(),
                     KeyCode::Char('f') => self.files_view = !self.files_view,
+                    KeyCode::Char('v') => self.slide_toggle_seen(),
                     KeyCode::Tab => {
                         if self.files_view && !self.sidebar_items.is_empty() {
                             self.focus = Focus::Sidebar;
@@ -513,7 +514,7 @@ impl App {
         }
         let (s, t) = self.seen_overall();
         left.push_str(&format!(" · seen {s}/{t}"));
-        let right = "n/p move · s notes · f files · enter diff · q quit ";
+        let right = "n/p · v seen · s notes · f files · enter diff · q quit ";
         let [l, r] = Layout::horizontal([
             Constraint::Min(1),
             Constraint::Length(display_width(right) as u16),
@@ -997,9 +998,42 @@ impl App {
             render_note(frame, body, &format!("cannot read {}", at.file));
             return;
         }
+        // Which of the shown changed lines are already marked seen.
+        let hashes: Vec<String> = file_diff(&self.files, &at.file)
+            .map(|fd| fd.hunks.iter().map(hunk_hash).collect())
+            .unwrap_or_default();
+        let seen_flags: Vec<bool> = rows
+            .iter()
+            .map(|r| match (r.hunk_idx, r.changed_idx) {
+                (Some(h), Some(i)) => self.seen.is_seen(&at.file, &hashes[h], i),
+                _ => false,
+            })
+            .collect();
+        let shown_changed = seen_flags
+            .iter()
+            .zip(&rows)
+            .filter(|(_, r)| r.changed_idx.is_some())
+            .count();
+        let shown_seen = seen_flags
+            .iter()
+            .zip(&rows)
+            .filter(|(s, r)| **s && r.changed_idx.is_some())
+            .count();
+
         let lang = Lang::from_path(&at.file);
-        let mut lines = vec![file_header(&at.file)];
-        lines.extend(excerpt_lines(&rows, lang, notes, body.width));
+        let mut header = file_header(&at.file);
+        if shown_changed > 0 {
+            if shown_seen == shown_changed {
+                header.push_span(Span::styled(" · ✓ seen", Style::new().green()));
+            } else if shown_seen > 0 {
+                header.push_span(Span::styled(
+                    format!(" · {shown_seen}/{shown_changed} seen"),
+                    Style::new().dim(),
+                ));
+            }
+        }
+        let mut lines = vec![header];
+        lines.extend(excerpt_lines(&rows, lang, notes, body.width, &seen_flags));
         frame.render_widget(Paragraph::new(lines), body);
     }
 
@@ -1009,6 +1043,33 @@ impl App {
         let lines = self.file_lines(&at.file).map(|l| l.to_vec());
         let fd = file_diff(&self.files, &at.file);
         excerpt(fd, lines.as_deref(), start, end)
+    }
+
+    /// The seen addresses of the changed lines the current excerpt shows.
+    fn visible_seen_lines(&mut self, at: &Anchor) -> Vec<(String, usize)> {
+        let rows = self.rows_for(at);
+        let Some(fd) = file_diff(&self.files, &at.file) else {
+            return Vec::new();
+        };
+        let hashes: Vec<String> = fd.hunks.iter().map(hunk_hash).collect();
+        rows.iter()
+            .filter_map(|r| match (r.hunk_idx, r.changed_idx) {
+                (Some(h), Some(i)) => Some((hashes[h].clone(), i)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `v` on a slide: mark exactly what the excerpt shows. Completes
+    /// first; a fully seen excerpt toggles back to unseen.
+    fn slide_toggle_seen(&mut self) {
+        let Some(at) = self.current().anchor().cloned() else {
+            return;
+        };
+        let lines = self.visible_seen_lines(&at);
+        if !lines.is_empty() {
+            self.seen.toggle_lines(&at.file, &lines);
+        }
     }
 
     fn draw_before_after(
@@ -1044,7 +1105,7 @@ impl App {
         let _ = gap;
         let side = |title: String, rows: &[ExcerptRow], width: u16| {
             let mut lines = vec![Line::from(title).style(Style::new().bold().dim())];
-            lines.extend(excerpt_lines(rows, lang, &[], width));
+            lines.extend(excerpt_lines(rows, lang, &[], width, &vec![false; rows.len()]));
             Paragraph::new(lines)
         };
         frame.render_widget(side(format!("── before · {}", at.file), &before, l.width), l);
@@ -1446,12 +1507,20 @@ fn excerpt_lines<'a>(
     lang: Lang,
     notes: &[Note],
     width: u16,
+    seen: &[bool],
 ) -> Vec<Line<'a>> {
     let mut out = Vec::new();
-    for row in rows {
-        let mut spans = code_spans(lang, &row.text, row.kind, row.segments.as_deref());
+    for (i, row) in rows.iter().enumerate() {
+        let row_seen = seen.get(i).copied().unwrap_or(false);
+        let mut spans = if row_seen && row.kind != LineKind::Context {
+            // Reviewed change sinks like context; the tint is reserved
+            // for what is still unreviewed.
+            code_spans(lang, &row.text, LineKind::Context, None)
+        } else {
+            code_spans(lang, &row.text, row.kind, row.segments.as_deref())
+        };
         // Extend the tint across the slide so a changed line reads as a band.
-        if row.kind != LineKind::Context {
+        if row.kind != LineKind::Context && !row_seen {
             let used = display_width(&row.text);
             let target = width as usize;
             if used < target {
@@ -2228,6 +2297,37 @@ diff --git a/f.rs b/f.rs
         let s = screen(&mut app);
         assert!(s.contains("seen 2/2"), "status total missing:\n{s}");
         assert!(s.contains("✓"), "file checkmark missing:\n{s}");
+    }
+
+    #[test]
+    fn slide_v_marks_only_the_visible_range() {
+        // Range 10-11 shows the del (changed 0) and the add (changed 1)
+        // but stops before the rest of the hunk.
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:10-11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        app.slide_toggle_seen();
+        let fd = file_diff(&app.files, "src/lib.rs").cloned().unwrap();
+        assert_eq!(app.seen.progress_for(&fd), (2, 2));
+        let s = screen(&mut app);
+        assert!(s.contains("✓ seen"), "header check missing:\n{s}");
+        // Toggling again clears exactly the same range.
+        app.slide_toggle_seen();
+        assert_eq!(app.seen.progress_for(&fd), (0, 2));
+
+        // A slide showing only unchanged context marks nothing.
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:13".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        let at: Anchor = "src/lib.rs:13-13".parse().unwrap();
+        let lines = app.visible_seen_lines(&at);
+        assert!(lines.is_empty());
     }
 
     #[test]

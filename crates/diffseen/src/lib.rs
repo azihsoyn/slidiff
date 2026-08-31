@@ -88,6 +88,17 @@ impl Store {
         self.save();
     }
 
+    /// Set one line's mark explicitly.
+    pub fn set_line(&mut self, file: &str, hunk_hash: &str, idx: usize, seen: bool) {
+        let set = self.entry(file, hunk_hash);
+        if seen {
+            set.insert(idx);
+        } else {
+            set.remove(&idx);
+        }
+        self.save();
+    }
+
     /// Mark the whole hunk seen or unseen.
     pub fn set_hunk(&mut self, file: &str, hunk_hash: &str, changed_total: usize, seen: bool) {
         let set = self.entry(file, hunk_hash);

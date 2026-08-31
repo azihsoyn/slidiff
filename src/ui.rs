@@ -315,7 +315,8 @@ impl App {
                 }
                 // Fixed geometry, derived from the terminal size alone:
                 // the page never moves or resizes between slides.
-                let geo = Geometry::of(main);
+                let has_sections = self.outline.iter().any(|s| !s.title.is_empty());
+                let geo = Geometry::of(main, has_sections);
                 let [_, page_row, notes_row, _, strip] = Layout::vertical([
                     Constraint::Fill(1),
                     Constraint::Length(geo.page_h),
@@ -399,10 +400,14 @@ impl App {
         };
         let total = (end - start) as u16 * pitch - 1;
         let x0 = area.x + area.width.saturating_sub(total) / 2;
+        let boxes_y = area.y + area.height.saturating_sub(3);
+        if area.height >= 4 {
+            self.draw_section_bands(frame, area.y, x0, pitch, start, end);
+        }
         for (j, i) in (start..end).enumerate() {
             let rect = Rect {
                 x: x0 + j as u16 * pitch,
-                y: area.y,
+                y: boxes_y,
                 width: 6,
                 height: 3,
             };
@@ -427,7 +432,7 @@ impl App {
             );
         }
         // Continuation marks when the window does not reach an end.
-        let mid_y = area.y + 1;
+        let mid_y = boxes_y + 1;
         if start > 0 && x0 >= area.x + 2 {
             frame.render_widget(
                 Paragraph::new("…").style(Style::new().dim()),
@@ -449,6 +454,63 @@ impl App {
                     height: 1,
                 },
             );
+        }
+    }
+
+    /// The bands over the boxes: one per section, spanning its slides,
+    /// current section lit. `…` where the window cuts a section short.
+    /// Clicking a band jumps to its headline slide.
+    fn draw_section_bands(
+        &mut self,
+        frame: &mut Frame,
+        y: u16,
+        x0: u16,
+        pitch: u16,
+        win_start: usize,
+        win_end: usize,
+    ) {
+        let n = self.deck.steps.len();
+        let current_section = self
+            .outline
+            .iter()
+            .rposition(|s| s.headline_step <= self.step);
+        for (si, section) in self.outline.iter().enumerate() {
+            if section.title.is_empty() {
+                continue;
+            }
+            let sec_end = self
+                .outline
+                .get(si + 1)
+                .map(|s| s.headline_step)
+                .unwrap_or(n);
+            let s = section.headline_step.max(win_start);
+            let e = sec_end.min(win_end);
+            if s >= e {
+                continue;
+            }
+            let x = x0 + (s - win_start) as u16 * pitch;
+            let width = (e - s) as u16 * pitch - 1;
+            let clipped_left = section.headline_step < win_start;
+            let clipped_right = sec_end > win_end;
+            let lead = if clipped_left { '…' } else { '╶' };
+            let trail = if clipped_right { '…' } else { '╴' };
+            let label = fit(&section.title, usize::from(width).saturating_sub(4));
+            let pad = usize::from(width)
+                .saturating_sub(display_width(&label) + 3);
+            let text = format!("{lead} {label} {}{trail}", "─".repeat(pad));
+            let style = if Some(si) == current_section {
+                Style::new().fg(ACCENT).bold()
+            } else {
+                Style::new().dim()
+            };
+            let rect = Rect {
+                x,
+                y,
+                width,
+                height: 1,
+            };
+            self.strip_boxes.push((rect, section.headline_step));
+            frame.render_widget(Paragraph::new(text).style(style), rect);
         }
     }
 
@@ -1081,8 +1143,13 @@ struct Geometry {
 }
 
 impl Geometry {
-    fn of(area: Rect) -> Geometry {
-        let strip_h = if area.height >= 22 { 3 } else { 0 };
+    fn of(area: Rect, has_sections: bool) -> Geometry {
+        // One extra strip row carries the section bands over the boxes.
+        let strip_h = if area.height >= 22 {
+            if has_sections { 4 } else { 3 }
+        } else {
+            0
+        };
         let page_w = area.width.saturating_sub(10).clamp(20, 96);
         // 16:9-ish: terminal cells are ~1:2, so rows ≈ cols × 9⁄32.
         let mut page_h = ((u32::from(page_w) * 9 / 32) as u16).max(10);
@@ -1504,6 +1571,41 @@ diff --git a/f.rs b/f.rs
         // Every visible box is a click target.
         assert!(!app.strip_boxes.is_empty());
         assert!(app.strip_boxes.iter().any(|(_, i)| *i == 30));
+    }
+
+    #[test]
+    fn section_band_spans_its_slides_and_click_jumps_to_headline() {
+        let point = |claim: &str| Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: claim.into(),
+            notes: vec![],
+            speaker_notes: None,
+        };
+        let mut app = app_with(vec![
+            Step::Cover {
+                what: "w".into(),
+                bullets: vec![],
+                speaker_notes: None,
+            },
+            Step::Cover {
+                what: "part one".into(),
+                bullets: vec![],
+                speaker_notes: None,
+            },
+            point("a"),
+            point("b"),
+        ]);
+        app.step = 2;
+        let s = screen(&mut app);
+        assert!(s.contains("╶ part one"), "band missing:\n{s}");
+        // The band is a click target for its headline.
+        let (rect, target) = *app
+            .strip_boxes
+            .iter()
+            .find(|(_, t)| *t == 1 && matches!(app.deck.steps[1], Step::Cover { .. }))
+            .expect("band hit area");
+        app.on_click(rect.x + 1, rect.y);
+        assert_eq!(app.step, target);
     }
 
     #[test]

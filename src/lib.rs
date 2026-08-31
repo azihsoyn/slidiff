@@ -6,7 +6,7 @@ pub mod mdeck;
 pub mod seen;
 pub mod ui;
 
-/// The deck JSON Schema, pretty-printed. Published via `debrief schema` and
+/// The deck JSON Schema, pretty-printed. Published via `slidiff schema` and
 /// pinned by the golden test — the schema is the contract agents write to.
 pub fn schema_json() -> String {
     let schema = schemars::schema_for!(deck::Deck);

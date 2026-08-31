@@ -1,6 +1,6 @@
 # The deck this branch would hand you about itself. View from the repo root:
 #   cargo run -- examples/self.yaml
-title: "debrief v0.2: 切り出しと注釈をスキーマで強制する"
+title: "slidiff v0.2: 切り出しと注釈をスキーマで強制する"
 base: master
 steps:
   - type: cover
@@ -12,7 +12,7 @@ steps:
   - type: map
     groups:
       - label: "スキーマ"
-        files: ["src/deck.rs", "schema/debrief.schema.json"]
+        files: ["src/deck.rs", "schema/slidiff.schema.json"]
       - label: "diff エンジン"
         files: ["src/diff/"]
       - label: "描画"

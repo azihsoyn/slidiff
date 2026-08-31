@@ -2,7 +2,7 @@
 members = [".", "crates/diffseen"]
 
 [package]
-name = "debrief"
+name = "slidiff"
 version = "0.1.0"
 edition = "2024"
 

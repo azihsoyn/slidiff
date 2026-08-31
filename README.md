@@ -1,4 +1,4 @@
-# debrief
+# slidiff
 
 A slide deck an agent writes and a person reads in the terminal, one claim to a
 screen.
@@ -21,9 +21,9 @@ reports how much of the diff the deck actually covers.
 ## Use
 
 ```
-debrief report.md          # view — press ? for the full keymap
-debrief check report.md    # validate; exit 1 with exactly what to fix
-debrief schema             # the JSON Schema agents write decks against
+slidiff report.md          # view — press ? for the full keymap
+slidiff check report.md    # validate; exit 1 with exactly what to fix
+slidiff schema             # the JSON Schema agents write decks against
 ```
 
 ## Asking back
@@ -31,12 +31,12 @@ debrief schema             # the JSON Schema agents write decks against
 A report you cannot interrogate is a dead end. `a` on any slide opens a
 question box; on Enter the slide's whole context — claim, `file:line`
 anchor, the excerpt as a real diff, notes — plus your question becomes one
-message. If `DEBRIEF_ASK_CMD` is set it is piped to that command
+message. If `SLIDIFF_ASK_CMD` is set it is piped to that command
 (`sh -c`, prompt on stdin):
 
 ```sh
 # e.g. drop the question straight into an agent's terminal pane:
-export DEBRIEF_ASK_CMD='herdr pane send-text w40:p1 "$(cat)"'
+export SLIDIFF_ASK_CMD='herdr pane send-text w40:p1 "$(cat)"'
 ```
 
 Otherwise it lands on the clipboard via OSC 52, ready to paste at any
@@ -50,7 +50,7 @@ marks the changed line under the cursor as seen (and moves on), `V` marks
 the whole hunk. Seen lines lose their tint — only what is still unreviewed
 stays vivid — and the sidebar tracks per-file progress (`3/5`, ✓ when done)
 including the files the deck never points at, each of them one click away.
-The record lives in `.git/debrief/seen.json`: local, never committed, and
+The record lives in `.git/slidiff/seen.json`: local, never committed, and
 keyed by hunk content, so a hunk that changes under you loses its marks
 automatically.
 
@@ -136,7 +136,7 @@ steps:
 
 ## For agents
 
-Ask for `debrief schema`, write YAML or JSON, run `debrief check`. Validation
+Ask for `slidiff schema`, write YAML or JSON, run `slidiff check`. Validation
 errors are phrased as instructions ("claim: 95 chars, limit is 80 — cut 15";
 "spans 31 lines, limit is 16 — narrow to the lines that matter"); oversized
 decks do not pass, so the rewrite happens on the writing side, not in the

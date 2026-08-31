@@ -7,8 +7,8 @@ use std::path::Path;
 
 #[test]
 fn schema_matches_golden() {
-    let golden_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/debrief.schema.json");
-    let current = debrief::schema_json() + "\n";
+    let golden_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/slidiff.schema.json");
+    let current = slidiff::schema_json() + "\n";
 
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         std::fs::create_dir_all(golden_path.parent().unwrap()).unwrap();
@@ -17,9 +17,9 @@ fn schema_matches_golden() {
     }
 
     let golden = std::fs::read_to_string(&golden_path)
-        .expect("schema/debrief.schema.json missing — run UPDATE_GOLDEN=1 cargo test");
+        .expect("schema/slidiff.schema.json missing — run UPDATE_GOLDEN=1 cargo test");
     assert_eq!(
         golden, current,
-        "schema drifted from schema/debrief.schema.json — if intentional, run UPDATE_GOLDEN=1 cargo test and commit the diff"
+        "schema drifted from schema/slidiff.schema.json — if intentional, run UPDATE_GOLDEN=1 cargo test and commit the diff"
     );
 }

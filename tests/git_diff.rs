@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use debrief::diff::{FileStatus, Repo, file_diff, hunk_at, load_diff};
+use slidiff::diff::{FileStatus, Repo, file_diff, hunk_at, load_diff};
 
 fn git(dir: &Path, args: &[&str]) {
     let status = Command::new("git")

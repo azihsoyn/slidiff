@@ -3,16 +3,16 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 
-use debrief::deck::Deck;
-use debrief::schema_json;
+use slidiff::deck::Deck;
+use slidiff::schema_json;
 
 const USAGE: &str = "\
-debrief — a deck an agent writes, a person reads in the terminal
+slidiff — a deck an agent writes, a person reads in the terminal
 
 usage:
-  debrief <deck.md|yaml>      view a deck (n/p step, Enter dive into full diff, q quit)
-  debrief check <deck.md|yaml>  validate a deck, exit 1 with what to fix
-  debrief schema              print the deck JSON Schema
+  slidiff <deck.md|yaml>      view a deck (n/p step, Enter dive into full diff, q quit)
+  slidiff check <deck.md|yaml>  validate a deck, exit 1 with what to fix
+  slidiff schema              print the deck JSON Schema
 ";
 
 fn main() -> ExitCode {
@@ -35,7 +35,7 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("debrief: {err:#}");
+            eprintln!("slidiff: {err:#}");
             ExitCode::FAILURE
         }
     }
@@ -52,7 +52,7 @@ fn load_deck(path: &Path) -> Result<Deck> {
     let deck: Deck = match path.extension().and_then(|e| e.to_str()) {
         Some("json") => serde_json::from_str(&text)
             .with_context(|| format!("{} is not a valid deck", path.display()))?,
-        Some("md" | "markdown") => debrief::mdeck::parse(&text)
+        Some("md" | "markdown") => slidiff::mdeck::parse(&text)
             .map_err(|errors| anyhow::anyhow!("{}", errors.join("\n")))?,
         _ => serde_yaml::from_str(&text)
             .with_context(|| format!("{} is not a valid deck", path.display()))?,
@@ -84,10 +84,10 @@ fn cmd_view(path: &Path) -> Result<ExitCode> {
         for error in &errors {
             eprintln!("{error}");
         }
-        bail!("deck does not validate — fix it or run `debrief check`");
+        bail!("deck does not validate — fix it or run `slidiff check`");
     }
     let cwd = std::env::current_dir().context("cannot read current dir")?;
-    let repo = debrief::diff::Repo::discover(&cwd)?;
-    debrief::ui::run(deck, repo)?;
+    let repo = slidiff::diff::Repo::discover(&cwd)?;
+    slidiff::ui::run(deck, repo)?;
     Ok(ExitCode::SUCCESS)
 }

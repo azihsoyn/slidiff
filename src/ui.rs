@@ -1126,7 +1126,7 @@ impl App {
     fn build_ask_prompt(&mut self, question: &str) -> String {
         let step = self.current().clone();
         let mut out = format!(
-            "Question about a change, asked from a debrief slide.\n\nDeck: {} (slide {}/{})\n",
+            "Question about a change, asked from a slidiff slide.\n\nDeck: {} (slide {}/{})\n",
             self.deck.title,
             self.step + 1,
             self.deck.steps.len(),
@@ -1882,11 +1882,11 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// Hand the question to whoever is listening: the command in
-/// DEBRIEF_ASK_CMD (prompt on stdin, run through `sh -c`), or failing
+/// SLIDIFF_ASK_CMD (prompt on stdin, run through `sh -c`), or failing
 /// that the clipboard via OSC 52 — works in any modern terminal, even
 /// over ssh.
 fn deliver_ask(prompt: &str) -> String {
-    if let Ok(cmd) = std::env::var("DEBRIEF_ASK_CMD") {
+    if let Ok(cmd) = std::env::var("SLIDIFF_ASK_CMD") {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let spawned = Command::new("sh")

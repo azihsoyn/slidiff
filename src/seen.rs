@@ -1,4 +1,4 @@
-//! debrief's adapter over the [`diffseen`] crate: maps our parsed diff
+//! slidiff's adapter over the [`diffseen`] crate: maps our parsed diff
 //! types onto its content-addressed store. The store itself — keying,
 //! persistence, invalidation-by-content — lives in `crates/diffseen` and
 //! knows nothing about this tool.
@@ -12,10 +12,10 @@ use crate::diff::{FileDiff, Hunk, LineKind};
 pub struct SeenStore(Store);
 
 impl SeenStore {
-    /// Persist under `<git-dir>/debrief/seen.json` — local, uncommitted.
+    /// Persist under `<git-dir>/slidiff/seen.json` — local, uncommitted.
     pub fn load(git_dir: Option<PathBuf>) -> SeenStore {
         match git_dir {
-            Some(dir) => SeenStore(Store::open(dir.join("debrief/seen.json"))),
+            Some(dir) => SeenStore(Store::open(dir.join("slidiff/seen.json"))),
             None => SeenStore(Store::in_memory()),
         }
     }

@@ -253,6 +253,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "diffseen",
  "ratatui",
  "schemars",
  "serde",
@@ -293,6 +294,15 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "diffseen"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

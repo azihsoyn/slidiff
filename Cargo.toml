@@ -1,9 +1,13 @@
+[workspace]
+members = [".", "crates/diffseen"]
+
 [package]
 name = "debrief"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+diffseen = { path = "crates/diffseen" }
 anyhow = "1.0.104"
 crossterm = "0.29.0"
 ratatui = "0.30.2"

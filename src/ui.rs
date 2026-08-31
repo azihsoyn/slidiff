@@ -424,11 +424,17 @@ impl App {
     }
 
     fn draw_cover(&self, frame: &mut Frame, area: Rect, what: &str, bullets: &[String]) {
-        let mut lines = vec![
-            Line::from(self.deck.title.clone().bold().fg(ACCENT)),
-            Line::default(),
-            Line::from(what.to_string().bold()),
-        ];
+        // The first slide carries the deck title; later cover-shaped
+        // slides are section headlines and stand on their own.
+        let mut lines = if self.step == 0 {
+            vec![
+                Line::from(self.deck.title.clone().bold().fg(ACCENT)),
+                Line::default(),
+                Line::from(what.to_string().bold()),
+            ]
+        } else {
+            vec![Line::from(what.to_string().bold().fg(ACCENT))]
+        };
         if !bullets.is_empty() {
             lines.push(Line::default());
             for b in bullets {

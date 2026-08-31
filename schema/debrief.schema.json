@@ -245,11 +245,11 @@
       ]
     },
     "steps": {
-      "description": "The slides. At most 12 — the schema refuses more.",
+      "description": "The slides. At most 40 — the schema refuses more.",
       "items": {
         "$ref": "#/$defs/Step"
       },
-      "maxItems": 12,
+      "maxItems": 40,
       "minItems": 1,
       "type": "array"
     },

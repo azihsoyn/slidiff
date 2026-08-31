@@ -15,8 +15,11 @@ use std::str::FromStr;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
-/// A deck may not exceed this many steps.
-pub const MAX_STEPS: usize = 12;
+/// A deck may not exceed this many steps. Per-slide limits keep each
+/// screen readable; deck length is allowed to scale with the change —
+/// a 12k-line branch legitimately needs dozens of stops, and the
+/// filmstrip plus the coverage meter keep a long deck navigable.
+pub const MAX_STEPS: usize = 40;
 /// A claim is one short line above the code, not a paragraph.
 pub const MAX_CLAIM_CHARS: usize = 80;
 /// A note hangs off a single line; it must fit next to code.
@@ -50,8 +53,8 @@ pub struct Deck {
     /// uncommitted changes against the last commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
-    /// The slides. At most 12 — the schema refuses more.
-    #[schemars(length(min = 1, max = 12))]
+    /// The slides. At most 40 — the schema refuses more.
+    #[schemars(length(min = 1, max = 40))]
     pub steps: Vec<Step>,
 }
 
@@ -537,7 +540,7 @@ mod tests {
         let deck = Deck {
             title: "t".into(),
             base: None,
-            steps: vec![step; 13],
+            steps: vec![step; 41],
         };
         let errors = deck.validate();
         assert!(errors.iter().any(|e| e.contains("merge or cut 1")));

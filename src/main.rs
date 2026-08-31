@@ -10,9 +10,9 @@ const USAGE: &str = "\
 debrief — a deck an agent writes, a person reads in the terminal
 
 usage:
-  debrief <deck.yaml>     view a deck (n/p step, Enter dive into full diff, q quit)
-  debrief check <deck.yaml>   validate a deck, exit 1 with what to fix
-  debrief schema          print the deck JSON Schema
+  debrief <deck.md|yaml>      view a deck (n/p step, Enter dive into full diff, q quit)
+  debrief check <deck.md|yaml>  validate a deck, exit 1 with what to fix
+  debrief schema              print the deck JSON Schema
 ";
 
 fn main() -> ExitCode {
@@ -52,6 +52,8 @@ fn load_deck(path: &Path) -> Result<Deck> {
     let deck: Deck = match path.extension().and_then(|e| e.to_str()) {
         Some("json") => serde_json::from_str(&text)
             .with_context(|| format!("{} is not a valid deck", path.display()))?,
+        Some("md" | "markdown") => debrief::mdeck::parse(&text)
+            .map_err(|errors| anyhow::anyhow!("{}", errors.join("\n")))?,
         _ => serde_yaml::from_str(&text)
             .with_context(|| format!("{} is not a valid deck", path.display()))?,
     };

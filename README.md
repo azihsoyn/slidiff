@@ -12,8 +12,10 @@ Selection is forced, not requested. A claim is one line (≤80 chars), an excerp
 is at most 16 lines, an explanation is a ≤48-char note attached to the exact
 line it is about. Pointing at a whole block, or writing a paragraph, does not
 fit the format and does not get written. The one place prose is allowed is
-`speaker_notes` (≤600 chars per step): shown below the slide, never on it,
-hidden with `s`.
+speaker notes (≤600 chars per step): shown below the slide, never on it,
+cycled with `s` (panel → popup → hidden). A deck holds up to 40 steps — each
+slide stays one claim, but deck length scales with the change, and the status
+bar always reports how much of the diff the deck actually covers.
 
 ## Use
 
@@ -24,7 +26,54 @@ debrief check report.yaml  # validate; exit 1 with exactly what to cut
 debrief schema             # the JSON Schema agents write decks against
 ```
 
-## A deck
+## A deck, in markdown
+
+Slides split on `---`; the first slide is the cover. A heading is the
+claim, `@` points at the code, list items `- 142: …` hang notes off lines,
+and everything below a lone `???` is speaker notes. Prose anywhere else on
+a slide is a parse error — the format stays as strict as the YAML.
+
+```markdown
+# Fix race in session cleanup
+base: main
+
+One line stating what was done
+- up to three bullets
+
+???
+Longer prose for the interested reader (markdown works here).
+
+---
+
+## The lock is now taken before the map read
+@ src/session.rs:138-150
+
+- 142: this ordering is the whole fix
+
+---
+
+## Callers holding the old iterator see a torn view
+@ src/api.rs:30-38 risk=medium
+
+---
+
+## Old vs new
+@ src/session.rs:138-150 before_after
+
+---
+
+## Where things landed
+@map
+- core: src/session/, src/api.rs
+
+---
+
+## A section headline
+
+- a slide with no @ is a headline slide
+```
+
+## The same deck, in YAML
 
 ```yaml
 title: "Fix race in session cleanup"

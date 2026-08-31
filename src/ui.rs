@@ -50,6 +50,9 @@ pub fn run(deck: Deck, repo: Repo) -> Result<()> {
         dive_file: None,
         sidebar_scroll: None,
         sidebar_area: Rect::default(),
+        focus: Focus::Slides,
+        sidebar_cursor: 0,
+        sidebar_items: Vec::new(),
         strip_boxes: Vec::new(),
         sidebar_hits: Vec::new(),
     };
@@ -73,6 +76,23 @@ enum SideTarget {
     Step(usize),
     /// Open the dive on a file the deck does not point at.
     File(String),
+}
+
+/// Where key input goes on the steps screen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Slides,
+    Sidebar,
+}
+
+/// One actionable sidebar row, for keyboard navigation.
+#[derive(Clone)]
+struct SideItem {
+    /// Index into the sidebar's display rows.
+    row: usize,
+    target: SideTarget,
+    /// Set when the row is a file — `v` toggles it seen wholesale.
+    file: Option<String>,
 }
 
 /// How the speaker notes are shown. `s` cycles panel → popup → hidden.
@@ -114,6 +134,12 @@ struct App {
     sidebar_scroll: Option<usize>,
     /// Where the sidebar was last drawn, for wheel routing.
     sidebar_area: Rect,
+    /// Keyboard focus on the steps screen; Tab switches.
+    focus: Focus,
+    /// Cursor into `sidebar_items` while the sidebar has focus.
+    sidebar_cursor: usize,
+    /// Actionable sidebar rows, top to bottom, refreshed on every draw.
+    sidebar_items: Vec<SideItem>,
     /// Filmstrip hit areas, refreshed on every draw: (box, step index).
     strip_boxes: Vec<(Rect, usize)>,
     /// Sidebar hit areas, refreshed on every draw.
@@ -287,6 +313,53 @@ impl App {
                 return Ok(());
             }
             match &mut self.mode {
+                Mode::Steps if self.focus == Focus::Sidebar => match key.code {
+                    KeyCode::Char('n' | 'j') | KeyCode::Down => {
+                        self.sidebar_cursor = (self.sidebar_cursor + 1)
+                            .min(self.sidebar_items.len().saturating_sub(1));
+                    }
+                    KeyCode::Char('p' | 'k') | KeyCode::Up => {
+                        self.sidebar_cursor = self.sidebar_cursor.saturating_sub(1);
+                    }
+                    KeyCode::Enter => {
+                        if let Some(item) = self.sidebar_items.get(self.sidebar_cursor).cloned() {
+                            match item.target {
+                                SideTarget::Step(step) => {
+                                    self.step = step;
+                                    self.focus = Focus::Slides;
+                                    self.sidebar_scroll = None;
+                                }
+                                SideTarget::File(file) => {
+                                    self.dive_file = Some(file);
+                                    self.mode = Mode::Dive {
+                                        scroll: 0,
+                                        cursor: 0,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('v') => {
+                        if let Some(path) = self
+                            .sidebar_items
+                            .get(self.sidebar_cursor)
+                            .and_then(|i| i.file.clone())
+                            && let Some(fd) =
+                                file_diff(&self.files, &path).cloned()
+                        {
+                            self.seen.toggle_file(&fd);
+                            // Marking flows downward here too.
+                            self.sidebar_cursor = (self.sidebar_cursor + 1)
+                                .min(self.sidebar_items.len().saturating_sub(1));
+                        }
+                    }
+                    KeyCode::Char('f') => {
+                        self.files_view = false;
+                        self.focus = Focus::Slides;
+                    }
+                    KeyCode::Tab | KeyCode::Esc => self.focus = Focus::Slides,
+                    _ => {}
+                },
                 Mode::Steps => match key.code {
                     KeyCode::Char('n' | 'j' | ' ') | KeyCode::Right | KeyCode::Down => {
                         if self.step + 1 < self.deck.steps.len() {
@@ -300,6 +373,11 @@ impl App {
                     }
                     KeyCode::Char('s') => self.notes_view = self.notes_view.next(),
                     KeyCode::Char('f') => self.files_view = !self.files_view,
+                    KeyCode::Tab => {
+                        if self.files_view && !self.sidebar_items.is_empty() {
+                            self.focus = Focus::Sidebar;
+                        }
+                    }
                     KeyCode::Enter => self.enter_dive(),
                     KeyCode::Esc => {
                         if self.notes_view == NotesView::Popup {
@@ -433,7 +511,6 @@ impl App {
         if let Some(at) = step.anchor() {
             left.push_str(&format!(" · {at}"));
         }
-        left.push_str(&format!(" · {}", self.coverage.summary_short()));
         let (s, t) = self.seen_overall();
         left.push_str(&format!(" · seen {s}/{t}"));
         let right = "n/p move · s notes · f files · enter diff · q quit ";
@@ -638,11 +715,16 @@ impl App {
     /// slide about that file.
     fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
         self.sidebar_hits.clear();
+        self.sidebar_items.clear();
         self.sidebar_area = area;
         frame.render_widget(
             Block::new()
                 .borders(ratatui::widgets::Borders::RIGHT)
-                .border_style(Style::new().dim()),
+                .border_style(if self.focus == Focus::Sidebar {
+                    Style::new().fg(ACCENT)
+                } else {
+                    Style::new().dim()
+                }),
             area,
         );
         let inner_w = usize::from(area.width.saturating_sub(2));
@@ -711,8 +793,14 @@ impl App {
 
         // (line, click target, is-current-file)
         let mut rows: Vec<(Line, Option<SideTarget>, bool)> = Vec::new();
+        let mut items: Vec<SideItem> = Vec::new();
         rows.push((
-            Line::from(" files".to_string()).style(Style::new().dim()),
+            Line::from(if self.focus == Focus::Sidebar {
+                " j/k · enter open · v seen".to_string()
+            } else {
+                format!(" {} · tab", self.coverage.summary_short())
+            })
+            .style(Style::new().dim()),
             None,
             false,
         ));
@@ -731,6 +819,11 @@ impl App {
                     Style::new()
                 };
                 let indent = if section.level == 1 { " " } else { "   " };
+                items.push(SideItem {
+                    row: rows.len(),
+                    target: SideTarget::Step(section.headline_step),
+                    file: None,
+                });
                 rows.push((
                     Line::from(format!(
                         "{indent}{}",
@@ -746,6 +839,11 @@ impl App {
             let file_indent = if section.level == 1 { "  " } else { "    " };
             for (path, first_step) in &section.files {
                 let is_current = current_file.as_deref() == Some(path.as_str());
+                items.push(SideItem {
+                    row: rows.len(),
+                    target: SideTarget::Step(*first_step),
+                    file: Some(path.clone()),
+                });
                 rows.push((
                     file_row(path, file_indent, is_current, false, &self.seen, &self.files),
                     Some(SideTarget::Step(*first_step)),
@@ -778,6 +876,11 @@ impl App {
             ));
             for fd in rest {
                 let is_current = self.dive_file.as_deref() == Some(fd.new_path.as_str());
+                items.push(SideItem {
+                    row: rows.len(),
+                    target: SideTarget::File(fd.new_path.clone()),
+                    file: Some(fd.new_path.clone()),
+                });
                 rows.push((
                     file_row(&fd.new_path, "  ", is_current, true, &self.seen, &self.files),
                     Some(SideTarget::File(fd.new_path.clone())),
@@ -786,18 +889,33 @@ impl App {
             }
         }
 
-        // Keep the current file's row in view unless the reader scrolled.
+        // The focused row: the keyboard cursor when the sidebar has focus,
+        // otherwise the current slide's file.
+        self.sidebar_cursor = self.sidebar_cursor.min(items.len().saturating_sub(1));
+        let focus_row = if self.focus == Focus::Sidebar {
+            let row = items.get(self.sidebar_cursor).map(|i| i.row).unwrap_or(0);
+            if let Some((line, _, _)) = rows.get_mut(row) {
+                *line = line.clone().style(Style::new().bg(Color::DarkGray));
+            }
+            row
+        } else {
+            rows.iter().position(|(_, _, cur)| *cur).unwrap_or(0)
+        };
+        self.sidebar_items = items;
+
+        // Keep the focused row in view unless the reader wheel-scrolled.
         let height = usize::from(area.height);
-        let focus = rows.iter().position(|(_, _, cur)| *cur).unwrap_or(0);
         let auto = if rows.len() <= height {
             0
         } else {
-            focus.saturating_sub(height / 2).min(rows.len() - height)
+            focus_row.saturating_sub(height / 2).min(rows.len() - height)
         };
-        let offset = self
-            .sidebar_scroll
-            .unwrap_or(auto)
-            .min(rows.len().saturating_sub(height.max(1)));
+        let offset = if self.focus == Focus::Sidebar {
+            auto
+        } else {
+            self.sidebar_scroll.unwrap_or(auto)
+        }
+        .min(rows.len().saturating_sub(height.max(1)));
         for (i, (line, target, _)) in rows.into_iter().enumerate().skip(offset).take(height) {
             let y = area.y + (i - offset) as u16;
             let rect = Rect {
@@ -1639,6 +1757,9 @@ diff --git a/src/lib.rs b/src/lib.rs
             dive_file: None,
             sidebar_scroll: None,
             sidebar_area: Rect::default(),
+            focus: Focus::Slides,
+            sidebar_cursor: 0,
+            sidebar_items: Vec::new(),
             strip_boxes: Vec::new(),
         }
     }
@@ -2077,6 +2198,36 @@ diff --git a/f.rs b/f.rs
         app.dive_file = None;
         let s = screen(&mut app);
         assert!(s.contains("-1 ✓"), "sidebar checkmark missing:\n{s}");
+    }
+
+    #[test]
+    fn sidebar_focus_navigates_and_v_marks_whole_file() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        screen(&mut app); // populate sidebar_items
+        assert!(!app.sidebar_items.is_empty());
+        app.focus = Focus::Sidebar;
+        // Walk the cursor to the file row of src/lib.rs.
+        app.sidebar_cursor = app
+            .sidebar_items
+            .iter()
+            .position(|i| i.file.as_deref() == Some("src/lib.rs"))
+            .expect("file item reachable by keyboard");
+        let s = screen(&mut app);
+        assert!(s.contains("v seen"), "focused hint missing:\n{s}");
+
+        // v marks the whole file, without entering the dive.
+        let path = "src/lib.rs".to_string();
+        let fd = file_diff(&app.files, &path).cloned().unwrap();
+        app.seen.toggle_file(&fd);
+        assert_eq!(app.seen.progress_for(&fd), (2, 2));
+        let s = screen(&mut app);
+        assert!(s.contains("seen 2/2"), "status total missing:\n{s}");
+        assert!(s.contains("✓"), "file checkmark missing:\n{s}");
     }
 
     #[test]

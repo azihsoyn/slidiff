@@ -21,11 +21,23 @@ reports how much of the diff the deck actually covers.
 ## Use
 
 ```
-debrief report.yaml        # view: n next, p prev, Enter dive into the diff, q quit
-                           # mouse: click the outline to jump, wheel to move
-debrief check report.yaml  # validate; exit 1 with exactly what to cut
+debrief report.md          # view: n next, p prev, Enter dive into the diff, q quit
+                           # s speaker notes, f file sidebar
+                           # mouse: click outline/sidebar to jump, wheel to move
+debrief check report.md    # validate; exit 1 with exactly what to fix
 debrief schema             # the JSON Schema agents write decks against
 ```
+
+## Review progress
+
+The deck is the guided tour; the dive is the inspection. In the dive, `v`
+marks the changed line under the cursor as seen (and moves on), `V` marks
+the whole hunk. Seen lines lose their tint — only what is still unreviewed
+stays vivid — and the sidebar tracks per-file progress (`3/5`, ✓ when done)
+including the files the deck never points at, each of them one click away.
+The record lives in `.git/debrief/seen.json`: local, never committed, and
+keyed by hunk content, so a hunk that changes under you loses its marks
+automatically.
 
 ## A deck, in markdown
 

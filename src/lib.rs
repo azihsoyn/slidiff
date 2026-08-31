@@ -3,6 +3,7 @@ pub mod diff;
 pub mod highlight;
 pub mod md;
 pub mod mdeck;
+pub mod seen;
 pub mod ui;
 
 /// The deck JSON Schema, pretty-printed. Published via `debrief schema` and

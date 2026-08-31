@@ -28,11 +28,13 @@ use crate::diff::{
     ExcerptRow, FileDiff, LineKind, Repo, Segment, emphasize_hunk, excerpt, file_diff, load_diff,
 };
 use crate::highlight::{Lang, highlight};
+use crate::seen::{SeenStore, changed_count, hunk_hash};
 
 pub fn run(deck: Deck, repo: Repo) -> Result<()> {
     let files = load_diff(&repo, deck.base.as_deref())?;
     let coverage = Coverage::compute(&deck, &files);
     let outline = outline_of(&deck);
+    let seen = SeenStore::load(repo.git_dir());
     let mut app = App {
         deck,
         repo,
@@ -44,6 +46,10 @@ pub fn run(deck: Deck, repo: Repo) -> Result<()> {
         notes_view: NotesView::Panel,
         files_view: true,
         file_cache: HashMap::new(),
+        seen,
+        dive_file: None,
+        sidebar_scroll: None,
+        sidebar_area: Rect::default(),
         strip_boxes: Vec::new(),
         sidebar_hits: Vec::new(),
     };
@@ -57,7 +63,16 @@ pub fn run(deck: Deck, repo: Repo) -> Result<()> {
 
 enum Mode {
     Steps,
-    Dive { scroll: u16 },
+    Dive { scroll: usize, cursor: usize },
+}
+
+/// What a sidebar row does when clicked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SideTarget {
+    /// Jump to a slide.
+    Step(usize),
+    /// Open the dive on a file the deck does not point at.
+    File(String),
 }
 
 /// How the speaker notes are shown. `s` cycles panel → popup → hidden.
@@ -91,10 +106,18 @@ struct App {
     /// The deck's sections and the files each one points at.
     outline: Vec<Section>,
     file_cache: HashMap<String, Option<Vec<String>>>,
+    /// Which changed lines the reader has marked seen. Local, persisted.
+    seen: SeenStore,
+    /// When set, the dive shows this file instead of the current step's.
+    dive_file: Option<String>,
+    /// Manual sidebar scroll (wheel); None follows the current slide.
+    sidebar_scroll: Option<usize>,
+    /// Where the sidebar was last drawn, for wheel routing.
+    sidebar_area: Rect,
     /// Filmstrip hit areas, refreshed on every draw: (box, step index).
     strip_boxes: Vec<(Rect, usize)>,
-    /// Sidebar hit areas, refreshed on every draw: (row, step index).
-    sidebar_hits: Vec<(Rect, usize)>,
+    /// Sidebar hit areas, refreshed on every draw.
+    sidebar_hits: Vec<(Rect, SideTarget)>,
 }
 
 /// A run of slides under one headline slide, and the files they point at.
@@ -220,21 +243,37 @@ impl App {
             let key = match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => key,
                 Event::Mouse(mouse) => {
+                    let over_sidebar = self.sidebar_area.contains(Position {
+                        x: mouse.column,
+                        y: mouse.row,
+                    });
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
                             self.on_click(mouse.column, mouse.row);
                         }
                         MouseEventKind::ScrollDown => match &mut self.mode {
+                            Mode::Steps if over_sidebar => {
+                                self.sidebar_scroll =
+                                    Some(self.sidebar_scroll.unwrap_or(0).saturating_add(3));
+                            }
                             Mode::Steps => {
                                 if self.step + 1 < self.deck.steps.len() {
                                     self.step += 1;
+                                    self.sidebar_scroll = None;
                                 }
                             }
-                            Mode::Dive { scroll } => *scroll = scroll.saturating_add(3),
+                            Mode::Dive { cursor, .. } => *cursor = cursor.saturating_add(3),
                         },
                         MouseEventKind::ScrollUp => match &mut self.mode {
-                            Mode::Steps => self.step = self.step.saturating_sub(1),
-                            Mode::Dive { scroll } => *scroll = scroll.saturating_sub(3),
+                            Mode::Steps if over_sidebar => {
+                                self.sidebar_scroll =
+                                    Some(self.sidebar_scroll.unwrap_or(0).saturating_sub(3));
+                            }
+                            Mode::Steps => {
+                                self.step = self.step.saturating_sub(1);
+                                self.sidebar_scroll = None;
+                            }
+                            Mode::Dive { cursor, .. } => *cursor = cursor.saturating_sub(3),
                         },
                         _ => {}
                     }
@@ -252,14 +291,16 @@ impl App {
                     KeyCode::Char('n' | 'j' | ' ') | KeyCode::Right | KeyCode::Down => {
                         if self.step + 1 < self.deck.steps.len() {
                             self.step += 1;
+                            self.sidebar_scroll = None;
                         }
                     }
                     KeyCode::Char('p' | 'k') | KeyCode::Left | KeyCode::Up => {
                         self.step = self.step.saturating_sub(1);
+                        self.sidebar_scroll = None;
                     }
                     KeyCode::Char('s') => self.notes_view = self.notes_view.next(),
                     KeyCode::Char('f') => self.files_view = !self.files_view,
-                    KeyCode::Enter => self.mode = Mode::Dive { scroll: 0 },
+                    KeyCode::Enter => self.enter_dive(),
                     KeyCode::Esc => {
                         if self.notes_view == NotesView::Popup {
                             self.notes_view = NotesView::Panel;
@@ -269,14 +310,19 @@ impl App {
                     }
                     _ => {}
                 },
-                Mode::Dive { scroll } => match key.code {
+                Mode::Dive { cursor, .. } => match key.code {
                     KeyCode::Char('n' | 'j') | KeyCode::Down => {
-                        *scroll = scroll.saturating_add(3);
+                        *cursor = cursor.saturating_add(1);
                     }
                     KeyCode::Char('p' | 'k') | KeyCode::Up => {
-                        *scroll = scroll.saturating_sub(3);
+                        *cursor = cursor.saturating_sub(1);
                     }
-                    KeyCode::Enter | KeyCode::Esc => self.mode = Mode::Steps,
+                    KeyCode::Char('v') => self.dive_toggle_line(),
+                    KeyCode::Char('V') => self.dive_toggle_hunk(),
+                    KeyCode::Enter | KeyCode::Esc => {
+                        self.mode = Mode::Steps;
+                        self.dive_file = None;
+                    }
                     _ => {}
                 },
             }
@@ -362,16 +408,21 @@ impl App {
                         draw_notes_popup(frame, area, text);
                     }
             }
-            Mode::Dive { scroll } => {
+            Mode::Dive { .. } => {
                 let [body, status] =
                     Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
                         .areas(frame.area());
-                self.draw_dive(frame, body, scroll);
-                let hint = " dive · n/p scroll · enter back · q quit ";
-                frame.render_widget(
-                    Paragraph::new(hint).style(Style::new().dim()).right_aligned(),
-                    status,
-                );
+                self.draw_dive(frame, body);
+                let (s, t) = self.seen_overall();
+                let left = format!(" dive · seen {s}/{t}");
+                let hint = "v line · V hunk · n/p move · enter back · q quit ";
+                let [l, r] = Layout::horizontal([
+                    Constraint::Min(1),
+                    Constraint::Length(display_width(hint) as u16),
+                ])
+                .areas(status);
+                frame.render_widget(Paragraph::new(left).style(Style::new().dim()), l);
+                frame.render_widget(Paragraph::new(hint).style(Style::new().dim()), r);
             }
         }
     }
@@ -383,6 +434,8 @@ impl App {
             left.push_str(&format!(" · {at}"));
         }
         left.push_str(&format!(" · {}", self.coverage.summary_short()));
+        let (s, t) = self.seen_overall();
+        left.push_str(&format!(" · seen {s}/{t}"));
         let right = "n/p move · s notes · f files · enter diff · q quit ";
         let [l, r] = Layout::horizontal([
             Constraint::Min(1),
@@ -554,13 +607,29 @@ impl App {
             return;
         }
         let pos = Position { x, y };
-        if let Some(&(_, step)) = self
-            .strip_boxes
-            .iter()
-            .chain(self.sidebar_hits.iter())
-            .find(|(rect, _)| rect.contains(pos))
-        {
+        if let Some(&(_, step)) = self.strip_boxes.iter().find(|(rect, _)| rect.contains(pos)) {
             self.step = step;
+            self.sidebar_scroll = None;
+            return;
+        }
+        let hit = self
+            .sidebar_hits
+            .iter()
+            .find(|(rect, _)| rect.contains(pos))
+            .map(|(_, target)| target.clone());
+        match hit {
+            Some(SideTarget::Step(step)) => {
+                self.step = step;
+                self.sidebar_scroll = None;
+            }
+            Some(SideTarget::File(file)) => {
+                self.dive_file = Some(file);
+                self.mode = Mode::Dive {
+                    scroll: 0,
+                    cursor: 0,
+                };
+            }
+            None => {}
         }
     }
 
@@ -569,6 +638,7 @@ impl App {
     /// slide about that file.
     fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
         self.sidebar_hits.clear();
+        self.sidebar_area = area;
         frame.render_widget(
             Block::new()
                 .borders(ratatui::widgets::Borders::RIGHT)
@@ -589,8 +659,58 @@ impl App {
                 .rposition(|s| s.level == 1 && !s.title.is_empty())
         });
 
+        // A file row: shortened path, +/- counts, seen progress.
+        let file_row = |path: &str,
+                        indent: &str,
+                        is_current: bool,
+                        dim_row: bool,
+                        seen: &SeenStore,
+                        files: &[FileDiff]|
+         -> Line<'static> {
+            let fd = file_diff(files, path);
+            let counts = fd.map(|fd| (fd.added(), fd.deleted()));
+            let progress = fd.map(|fd| seen.progress_for(fd)).unwrap_or((0, 0));
+            let seen_text = match progress {
+                (_, 0) => String::new(),
+                (s, t) if s == t => " ✓".to_string(),
+                (0, _) => String::new(),
+                (s, t) => format!(" {s}/{t}"),
+            };
+            let count_len = counts
+                .map(|(a, d)| format!(" +{a} -{d}").len())
+                .unwrap_or(0)
+                + seen_text.len();
+            let name_w = inner_w.saturating_sub(count_len + indent.len() + 1);
+            let marker = if is_current { "▎" } else { " " };
+            let dim_if = |s: Style| if dim_row { s.add_modifier(Modifier::DIM) } else { s };
+            let mut spans = vec![
+                Span::raw(indent.to_string()),
+                Span::styled(
+                    marker.to_string(),
+                    if is_current { Style::new().fg(ACCENT) } else { Style::new() },
+                ),
+                Span::styled(
+                    fit(path, name_w),
+                    dim_if(if is_current { Style::new().bold() } else { Style::new() }),
+                ),
+            ];
+            if let Some((a, d)) = counts {
+                spans.push(Span::styled(format!(" +{a}"), Style::new().green().dim()));
+                spans.push(Span::styled(format!(" -{d}"), Style::new().red().dim()));
+            }
+            if !seen_text.is_empty() {
+                let style = if seen_text == " ✓" {
+                    Style::new().green()
+                } else {
+                    Style::new().dim()
+                };
+                spans.push(Span::styled(seen_text, style));
+            }
+            Line::from(spans)
+        };
+
         // (line, click target, is-current-file)
-        let mut rows: Vec<(Line, Option<usize>, bool)> = Vec::new();
+        let mut rows: Vec<(Line, Option<SideTarget>, bool)> = Vec::new();
         rows.push((
             Line::from(" files".to_string()).style(Style::new().dim()),
             None,
@@ -617,7 +737,7 @@ impl App {
                         fit(&section.title, inner_w.saturating_sub(indent.len()))
                     ))
                     .style(style),
-                    Some(section.headline_step),
+                    Some(SideTarget::Step(section.headline_step)),
                     false,
                 ));
             } else {
@@ -626,80 +746,70 @@ impl App {
             let file_indent = if section.level == 1 { "  " } else { "    " };
             for (path, first_step) in &section.files {
                 let is_current = current_file.as_deref() == Some(path.as_str());
-                let counts = file_diff(&self.files, path)
-                    .map(|fd| (fd.added(), fd.deleted()));
-                let count_text = match counts {
-                    Some((a, d)) => format!(" +{a} -{d}"),
-                    None => String::new(),
-                };
-                let name_w = inner_w.saturating_sub(count_text.len() + file_indent.len() + 1);
-                let marker = if is_current { "▎" } else { " " };
-                let marker_style = if is_current {
-                    Style::new().fg(ACCENT)
-                } else {
-                    Style::new()
-                };
-                let name_style = if is_current {
-                    Style::new().bold()
-                } else {
-                    Style::new()
-                };
-                let mut spans = vec![
-                    Span::raw(file_indent.to_string()),
-                    Span::styled(marker.to_string(), marker_style),
-                    Span::styled(fit(path, name_w), name_style),
-                ];
-                if let Some((a, d)) = counts {
-                    spans.push(Span::styled(format!(" +{a}"), Style::new().green().dim()));
-                    spans.push(Span::styled(format!(" -{d}"), Style::new().red().dim()));
-                }
-                rows.push((Line::from(spans), Some(*first_step), is_current));
+                rows.push((
+                    file_row(path, file_indent, is_current, false, &self.seen, &self.files),
+                    Some(SideTarget::Step(*first_step)),
+                    is_current,
+                ));
             }
         }
-        if !self.coverage.untouched_top.is_empty() || self.coverage.files_touched < self.coverage.files_total {
-            let rest = self.coverage.files_total - self.coverage.files_touched;
+
+        // Files the deck never points at — reachable, so "not looked at
+        // yet" has somewhere to be looked at.
+        let pointed: std::collections::HashSet<&str> = self
+            .outline
+            .iter()
+            .flat_map(|s| s.files.iter().map(|(p, _)| p.as_str()))
+            .collect();
+        let mut rest: Vec<&FileDiff> = self
+            .files
+            .iter()
+            .filter(|fd| !pointed.contains(fd.new_path.as_str()))
+            .filter(|fd| fd.added() + fd.deleted() > 0)
+            .collect();
+        rest.sort_by_key(|fd| std::cmp::Reverse(fd.added() + fd.deleted()));
+        if !rest.is_empty() {
             rows.push((Line::default(), None, false));
             rows.push((
-                Line::from(format!(" not in deck: {rest} files"))
+                Line::from(format!(" not in deck ({})", rest.len()))
                     .style(Style::new().dim().italic()),
                 None,
                 false,
             ));
+            for fd in rest {
+                let is_current = self.dive_file.as_deref() == Some(fd.new_path.as_str());
+                rows.push((
+                    file_row(&fd.new_path, "  ", is_current, true, &self.seen, &self.files),
+                    Some(SideTarget::File(fd.new_path.clone())),
+                    is_current,
+                ));
+            }
         }
 
-        // Keep the current file's row in view.
+        // Keep the current file's row in view unless the reader scrolled.
         let height = usize::from(area.height);
-        let focus = rows
-            .iter()
-            .position(|(_, _, cur)| *cur)
-            .unwrap_or(0);
-        let offset = if rows.len() <= height {
+        let focus = rows.iter().position(|(_, _, cur)| *cur).unwrap_or(0);
+        let auto = if rows.len() <= height {
             0
         } else {
             focus.saturating_sub(height / 2).min(rows.len() - height)
         };
+        let offset = self
+            .sidebar_scroll
+            .unwrap_or(auto)
+            .min(rows.len().saturating_sub(height.max(1)));
         for (i, (line, target, _)) in rows.into_iter().enumerate().skip(offset).take(height) {
             let y = area.y + (i - offset) as u16;
-            if let Some(step) = target {
-                self.sidebar_hits.push((
-                    Rect {
-                        x: area.x,
-                        y,
-                        width: area.width.saturating_sub(1),
-                        height: 1,
-                    },
-                    step,
-                ));
+            let rect = Rect {
+                x: area.x,
+                y,
+                width: area.width.saturating_sub(1),
+                height: 1,
+            };
+            if let Some(target) = target {
+                self.sidebar_hits.push((rect, target));
             }
-            frame.render_widget(
-                Paragraph::new(line),
-                Rect {
-                    x: area.x,
-                    y,
-                    width: area.width.saturating_sub(1),
-                    height: 1,
-                },
-            );
+            frame.render_widget(Paragraph::new(line), rect);
         }
     }
 
@@ -930,31 +1040,160 @@ impl App {
         frame.render_widget(Paragraph::new(lines), centered(area, width, height));
     }
 
-    fn draw_dive(&mut self, frame: &mut Frame, area: Rect, scroll: u16) {
-        let target = self.current().anchor().cloned();
-        let files: Vec<&FileDiff> = match &target {
-            Some(at) => self.files.iter().filter(|f| f.new_path == at.file).collect(),
-            None => self.files.iter().collect(),
+    /// Which files the dive shows: an explicitly opened file, the current
+    /// step's file, or — from a slide with no anchor — everything.
+    fn dive_paths(&self) -> Vec<String> {
+        if let Some(f) = &self.dive_file {
+            return vec![f.clone()];
+        }
+        match self.current().anchor() {
+            Some(at) => vec![at.file.clone()],
+            None => self.files.iter().map(|f| f.new_path.clone()).collect(),
+        }
+    }
+
+    /// Row metadata for the dive, exactly parallel to its display rows.
+    fn dive_meta(&self) -> Vec<DiveMeta> {
+        let mut meta = Vec::new();
+        for path in self.dive_paths() {
+            let Some(fd) = file_diff(&self.files, &path) else {
+                continue;
+            };
+            for hunk in &fd.hunks {
+                let hash = hunk_hash(hunk);
+                let total = changed_count(hunk);
+                meta.push(DiveMeta::header());
+                let mut changed_idx = 0;
+                for line in &hunk.lines {
+                    let idx = (line.kind != LineKind::Context).then(|| {
+                        let i = changed_idx;
+                        changed_idx += 1;
+                        i
+                    });
+                    meta.push(DiveMeta {
+                        file: Some(fd.new_path.clone()),
+                        hunk_hash: Some(hash.clone()),
+                        changed_idx: idx,
+                        changed_total: total,
+                        new_no: line.new_no,
+                    });
+                }
+                meta.push(DiveMeta::header());
+            }
+        }
+        meta
+    }
+
+    fn enter_dive(&mut self) {
+        let cursor = match self.current().anchor() {
+            Some(at) => self
+                .dive_meta()
+                .iter()
+                .position(|m| m.new_no == Some(at.focus()))
+                .unwrap_or(0),
+            None => 0,
         };
-        if files.is_empty() {
-            let msg = match &target {
-                Some(at) => format!("{} is not in this diff", at.file),
-                None => "no changes in this diff".to_string(),
+        self.mode = Mode::Dive { scroll: 0, cursor };
+    }
+
+    fn dive_toggle_line(&mut self) {
+        let Mode::Dive { cursor, .. } = self.mode else {
+            return;
+        };
+        let meta = self.dive_meta();
+        let Some(m) = meta.get(cursor) else { return };
+        if let (Some(file), Some(hash), Some(idx)) = (&m.file, &m.hunk_hash, m.changed_idx) {
+            self.seen.toggle_line(file, hash, idx);
+            // Move on to the next changed line — marking flows downward.
+            if let Some(next) = meta
+                .iter()
+                .enumerate()
+                .skip(cursor + 1)
+                .find(|(_, m)| m.changed_idx.is_some())
+                .map(|(i, _)| i)
+                && let Mode::Dive { cursor, .. } = &mut self.mode
+            {
+                *cursor = next;
+            }
+        }
+    }
+
+    fn dive_toggle_hunk(&mut self) {
+        let Mode::Dive { cursor, .. } = self.mode else {
+            return;
+        };
+        let meta = self.dive_meta();
+        let Some(m) = meta.get(cursor) else { return };
+        if let (Some(file), Some(hash)) = (&m.file, &m.hunk_hash) {
+            self.seen.toggle_hunk(file, hash, m.changed_total);
+        }
+    }
+
+    /// (seen, total) changed lines across the whole diff.
+    fn seen_overall(&self) -> (usize, usize) {
+        self.files
+            .iter()
+            .map(|fd| self.seen.progress_for(fd))
+            .fold((0, 0), |(s, t), (a, b)| (s + a, t + b))
+    }
+
+    fn draw_dive(&mut self, frame: &mut Frame, area: Rect) {
+        let paths = self.dive_paths();
+        let shown: Vec<&FileDiff> = paths
+            .iter()
+            .filter_map(|p| file_diff(&self.files, p))
+            .collect();
+        if shown.is_empty() {
+            let msg = match paths.first() {
+                Some(p) if paths.len() == 1 => format!("{p} is not in this diff"),
+                _ => "no changes in this diff".to_string(),
             };
             render_note(frame, area, &msg);
             return;
         }
+
+        // Build display rows; must stay parallel to dive_meta().
+        let meta = self.dive_meta();
+        let Mode::Dive { scroll, cursor } = &mut self.mode else {
+            return;
+        };
+        *cursor = (*cursor).min(meta.len().saturating_sub(1));
         let mut lines: Vec<Line> = Vec::new();
-        for fd in files {
+        for fd in shown {
             let lang = Lang::from_path(&fd.new_path);
             for hunk in &fd.hunks {
+                let hash = hunk_hash(hunk);
+                let (h_seen, h_total) = (
+                    (0..changed_count(hunk))
+                        .filter(|&i| self.seen.is_seen(&fd.new_path, &hash, i))
+                        .count(),
+                    changed_count(hunk),
+                );
                 let mut header = format!("── {}", fd.new_path);
                 if !hunk.section.is_empty() {
                     header.push_str(&format!(" · {}", hunk.section));
                 }
-                lines.push(Line::from(header).style(Style::new().bold().dim()));
+                let mut spans = vec![Span::styled(header, Style::new().bold().dim())];
+                if h_total > 0 {
+                    let (text, style) = if h_seen == h_total {
+                        (" ✓ seen".to_string(), Style::new().green())
+                    } else {
+                        (format!(" {h_seen}/{h_total}"), Style::new().dim())
+                    };
+                    spans.push(Span::styled(text, style));
+                }
+                lines.push(Line::from(spans));
                 let segs = emphasize_hunk(hunk);
+                let mut changed_idx = 0usize;
                 for (line, seg) in hunk.lines.iter().zip(segs) {
+                    let is_changed = line.kind != LineKind::Context;
+                    let line_seen = is_changed
+                        && self.seen.is_seen(&fd.new_path, &hash, changed_idx);
+                    let mark = if line_seen {
+                        Span::styled("✓ ", Style::new().green().dim())
+                    } else {
+                        Span::raw("  ")
+                    };
                     let no = format!(
                         "{:>5} ",
                         line.new_no
@@ -962,20 +1201,61 @@ impl App {
                             .map(|n| n.to_string())
                             .unwrap_or_default()
                     );
-                    let mut spans = vec![Span::styled(no, Style::new().dim())];
-                    spans.extend(code_spans(lang, &line.text, line.kind, Some(&seg)));
+                    let mut spans = vec![mark, Span::styled(no, Style::new().dim())];
+                    if line_seen {
+                        // A seen change sinks like context: the vivid tint
+                        // is reserved for what is still unreviewed.
+                        spans.extend(code_spans(lang, &line.text, LineKind::Context, None));
+                    } else {
+                        spans.extend(code_spans(lang, &line.text, line.kind, Some(&seg)));
+                    }
                     let mut out = Line::from(spans);
-                    if let Some(t) = &target
-                        && line.new_no == Some(t.focus()) {
-                            out = out.style(Style::new().bg(Color::DarkGray));
-                        }
+                    if lines.len() == *cursor {
+                        out = out.style(Style::new().bg(Color::DarkGray));
+                    }
                     lines.push(out);
+                    if is_changed {
+                        changed_idx += 1;
+                    }
                 }
                 lines.push(Line::default());
             }
         }
-        let max = (lines.len() as u16).saturating_sub(area.height);
-        frame.render_widget(Paragraph::new(lines).scroll((scroll.min(max), 0)), area);
+
+        // Keep the cursor in view.
+        let height = usize::from(area.height);
+        if *cursor < *scroll {
+            *scroll = *cursor;
+        } else if *cursor >= *scroll + height {
+            *scroll = *cursor + 1 - height;
+        }
+        *scroll = (*scroll).min(lines.len().saturating_sub(height.max(1)));
+        frame.render_widget(
+            Paragraph::new(lines).scroll((*scroll as u16, 0)),
+            area,
+        );
+    }
+}
+
+/// One dive display row. `changed_idx` is the line's index among its
+/// hunk's changed lines — the unit of the seen record.
+struct DiveMeta {
+    file: Option<String>,
+    hunk_hash: Option<String>,
+    changed_idx: Option<usize>,
+    changed_total: usize,
+    new_no: Option<u32>,
+}
+
+impl DiveMeta {
+    fn header() -> DiveMeta {
+        DiveMeta {
+            file: None,
+            hunk_hash: None,
+            changed_idx: None,
+            changed_total: 0,
+            new_no: None,
+        }
     }
 }
 
@@ -1355,6 +1635,10 @@ diff --git a/src/lib.rs b/src/lib.rs
             mode: Mode::Steps,
             notes_view: NotesView::Panel,
             file_cache: HashMap::new(),
+            seen: SeenStore::in_memory(),
+            dive_file: None,
+            sidebar_scroll: None,
+            sidebar_area: Rect::default(),
             strip_boxes: Vec::new(),
         }
     }
@@ -1499,7 +1783,7 @@ diff --git a/f.rs b/f.rs
             notes: vec![],
             speaker_notes: None,
         }]);
-        app.mode = Mode::Dive { scroll: 0 };
+        app.mode = Mode::Dive { scroll: 0, cursor: 0 };
         let s = screen(&mut app);
         assert!(s.contains("self.notify();"), "{s}");
         assert!(s.contains("11"), "dive keeps line numbers:\n{s}");
@@ -1595,13 +1879,14 @@ diff --git a/f.rs b/f.rs
         assert!(s.contains(" files"), "sidebar header missing:\n{s}");
         assert!(s.contains("section one"), "section title missing:\n{s}");
         assert!(s.contains("src/lib.rs +1 -1"), "file row missing:\n{s}");
-        let (rect, target) = *app
+        let (rect, target) = app
             .sidebar_hits
             .iter()
-            .find(|(_, t)| *t == 2)
+            .find(|(_, t)| *t == SideTarget::Step(2))
+            .cloned()
             .expect("file row hit area");
         app.on_click(rect.x + 2, rect.y);
-        assert_eq!(app.step, target);
+        assert_eq!(SideTarget::Step(app.step), target);
 
         app.files_view = false;
         let s = screen(&mut app);
@@ -1726,6 +2011,72 @@ diff --git a/f.rs b/f.rs
         // A click outside every box changes nothing.
         app.on_click(0, 0);
         assert_eq!(app.step, 1);
+    }
+
+    #[test]
+    fn v_marks_a_changed_line_seen_and_advances() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        app.enter_dive();
+        // enter_dive lands the cursor on the anchor line (new_no 11, the add).
+        let meta = app.dive_meta();
+        let Mode::Dive { cursor: at_anchor, .. } = app.mode else { panic!() };
+        assert_eq!(meta[at_anchor].new_no, Some(11));
+        assert!(meta[at_anchor].changed_idx.is_some());
+
+        // Start from the first changed line (the deletion) so v can advance.
+        let cursor = meta.iter().position(|m| m.changed_idx == Some(0)).unwrap();
+        app.mode = Mode::Dive { scroll: 0, cursor };
+        app.dive_toggle_line();
+        let s = screen(&mut app);
+        assert!(s.contains("✓"), "seen mark missing:\n{s}");
+        assert!(s.contains("seen 1/2"), "status count missing:\n{s}");
+        // The cursor advanced past the toggled line.
+        let Mode::Dive { cursor: after, .. } = app.mode else { panic!() };
+        assert!(after > cursor);
+
+        // V on a row of the same hunk marks the rest, toggling to full.
+        app.mode = Mode::Dive { scroll: 0, cursor };
+        app.dive_toggle_hunk();
+        let s = screen(&mut app);
+        assert!(s.contains("seen 2/2"), "{s}");
+        assert!(s.contains("✓ seen"), "hunk header check missing:\n{s}");
+    }
+
+    #[test]
+    fn sidebar_shows_seen_progress_and_not_in_deck_opens_dive() {
+        // Deck points at nothing → src/lib.rs lands in "not in deck".
+        let mut app = app_with(vec![Step::Cover {
+            what: "w".into(),
+            bullets: vec![],
+            level: 1,
+            speaker_notes: None,
+        }]);
+        let s = screen(&mut app);
+        assert!(s.contains("not in deck (1)"), "{s}");
+        let (rect, _) = app
+            .sidebar_hits
+            .iter()
+            .find(|(_, t)| matches!(t, SideTarget::File(_)))
+            .cloned()
+            .expect("file target");
+        app.on_click(rect.x + 2, rect.y);
+        assert!(matches!(app.mode, Mode::Dive { .. }));
+        assert_eq!(app.dive_file.as_deref(), Some("src/lib.rs"));
+        let s = screen(&mut app);
+        assert!(s.contains("self.map.take(&id);"), "dive should show the file:\n{s}");
+
+        // Mark everything seen; the sidebar row gains a checkmark.
+        app.mode = Mode::Dive { scroll: 0, cursor: 2 };
+        app.dive_toggle_hunk();
+        app.mode = Mode::Steps;
+        app.dive_file = None;
+        let s = screen(&mut app);
+        assert!(s.contains("-1 ✓"), "sidebar checkmark missing:\n{s}");
     }
 
     #[test]

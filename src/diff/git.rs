@@ -26,6 +26,12 @@ impl Repo {
         git_in(&self.root, args)
     }
 
+    /// The actual git dir (resolves the `.git` file of a linked worktree).
+    pub fn git_dir(&self) -> Option<PathBuf> {
+        let out = self.git(&["rev-parse", "--absolute-git-dir"]).ok()?;
+        Some(PathBuf::from(out.trim()))
+    }
+
     /// Resolve what the deck's `base` means as a concrete diff base:
     /// the merge-base of `base` and HEAD. Diffing from there shows the
     /// work done since branching plus anything uncommitted, and never

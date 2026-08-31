@@ -51,6 +51,9 @@ pub fn run(deck: Deck, repo: Repo) -> Result<()> {
         sidebar_scroll: None,
         sidebar_area: Rect::default(),
         focus: Focus::Slides,
+        ask: None,
+        help: false,
+        toast: None,
         sidebar_cursor: 0,
         sidebar_items: Vec::new(),
         strip_boxes: Vec::new(),
@@ -136,6 +139,12 @@ struct App {
     sidebar_area: Rect,
     /// Keyboard focus on the steps screen; Tab switches.
     focus: Focus,
+    /// Open question input (`a`): the buffer being typed.
+    ask: Option<String>,
+    /// Keyboard shortcut overlay (`?`); any key closes it.
+    help: bool,
+    /// One-shot status message (e.g. "copied"), cleared on the next key.
+    toast: Option<String>,
     /// Cursor into `sidebar_items` while the sidebar has focus.
     sidebar_cursor: usize,
     /// Actionable sidebar rows, top to bottom, refreshed on every draw.
@@ -309,7 +318,37 @@ impl App {
             };
             let ctrl_c = key.code == KeyCode::Char('c')
                 && key.modifiers.contains(KeyModifiers::CONTROL);
-            if ctrl_c || key.code == KeyCode::Char('q') {
+            if ctrl_c {
+                return Ok(());
+            }
+            // The question input swallows every key while open — `q` is a
+            // letter here, not quit.
+            if let Some(buf) = &mut self.ask {
+                match key.code {
+                    KeyCode::Esc => self.ask = None,
+                    KeyCode::Enter => {
+                        let question = self.ask.take().unwrap_or_default();
+                        let prompt = self.build_ask_prompt(&question);
+                        self.toast = Some(deliver_ask(&prompt));
+                    }
+                    KeyCode::Backspace => {
+                        buf.pop();
+                    }
+                    KeyCode::Char(c) => buf.push(c),
+                    _ => {}
+                }
+                continue;
+            }
+            self.toast = None;
+            if self.help {
+                self.help = false;
+                continue;
+            }
+            if key.code == KeyCode::Char('?') {
+                self.help = true;
+                continue;
+            }
+            if key.code == KeyCode::Char('q') {
                 return Ok(());
             }
             match &mut self.mode {
@@ -374,6 +413,7 @@ impl App {
                     KeyCode::Char('s') => self.notes_view = self.notes_view.next(),
                     KeyCode::Char('f') => self.files_view = !self.files_view,
                     KeyCode::Char('v') => self.slide_toggle_seen(),
+                    KeyCode::Char('a') => self.ask = Some(String::new()),
                     KeyCode::Tab => {
                         if self.files_view && !self.sidebar_items.is_empty() {
                             self.focus = Focus::Sidebar;
@@ -486,6 +526,20 @@ impl App {
                     && let Some(text) = &notes_text {
                         draw_notes_popup(frame, area, text);
                     }
+                if let Some(buf) = &self.ask {
+                    let context = match self.current().anchor() {
+                        Some(at) => format!(
+                            "slide {}/{} · {at}",
+                            self.step + 1,
+                            self.deck.steps.len()
+                        ),
+                        None => format!("slide {}/{}", self.step + 1, self.deck.steps.len()),
+                    };
+                    draw_ask_popup(frame, area, buf, &context);
+                }
+                if self.help {
+                    draw_help(frame, area);
+                }
             }
             Mode::Dive { .. } => {
                 let [body, status] =
@@ -494,7 +548,7 @@ impl App {
                 self.draw_dive(frame, body);
                 let (s, t) = self.seen_overall();
                 let left = format!(" dive · seen {s}/{t}");
-                let hint = "v line · V hunk · n/p move · enter back · q quit ";
+                let hint = "v line · V hunk · n/p move · ? keys · enter back · q quit ";
                 let [l, r] = Layout::horizontal([
                     Constraint::Min(1),
                     Constraint::Length(display_width(hint) as u16),
@@ -502,6 +556,9 @@ impl App {
                 .areas(status);
                 frame.render_widget(Paragraph::new(left).style(Style::new().dim()), l);
                 frame.render_widget(Paragraph::new(hint).style(Style::new().dim()), r);
+                if self.help {
+                    draw_help(frame, body);
+                }
             }
         }
     }
@@ -514,7 +571,10 @@ impl App {
         }
         let (s, t) = self.seen_overall();
         left.push_str(&format!(" · seen {s}/{t}"));
-        let right = "n/p · v seen · s notes · f files · enter diff · q quit ";
+        if let Some(toast) = &self.toast {
+            left.push_str(&format!("  ▸ {toast}"));
+        }
+        let right = "n/p · v seen · a ask · ? keys · enter diff · q quit ";
         let [l, r] = Layout::horizontal([
             Constraint::Min(1),
             Constraint::Length(display_width(right) as u16),
@@ -1058,6 +1118,57 @@ impl App {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The package `a` sends to an agent: everything the slide shows —
+    /// claim, anchor, the excerpt as a real diff, notes — plus the
+    /// question. Whoever receives it can open the code immediately.
+    fn build_ask_prompt(&mut self, question: &str) -> String {
+        let step = self.current().clone();
+        let mut out = format!(
+            "Question about a change, asked from a debrief slide.\n\nDeck: {} (slide {}/{})\n",
+            self.deck.title,
+            self.step + 1,
+            self.deck.steps.len(),
+        );
+        if let Some(claim) = match &step {
+            Step::Point { claim, .. } | Step::Risk { claim, .. } => Some(claim.clone()),
+            Step::BeforeAfter { claim, .. } => claim.clone(),
+            Step::Cover { what, .. } => Some(what.clone()),
+            Step::Map { .. } => None,
+        } {
+            out.push_str(&format!("Claim: {claim}\n"));
+        }
+        if let Some(at) = step.anchor() {
+            out.push_str(&format!("At: {at}\n\n```diff\n"));
+            for row in self.rows_for(at) {
+                let sign = match row.kind {
+                    LineKind::Context => ' ',
+                    LineKind::Add => '+',
+                    LineKind::Del => '-',
+                };
+                out.push(sign);
+                out.push_str(&row.text);
+                out.push('\n');
+            }
+            out.push_str("```\n");
+        }
+        if !step.notes().is_empty() {
+            out.push_str("\nLine notes:\n");
+            for note in step.notes() {
+                out.push_str(&format!("- {}: {}\n", note.line, note.text));
+            }
+        }
+        if let Some(sn) = step.speaker_notes() {
+            out.push_str(&format!("\nSpeaker notes:\n{sn}\n"));
+        }
+        let question = if question.trim().is_empty() {
+            "この変更の意図と動作を説明してください。"
+        } else {
+            question
+        };
+        out.push_str(&format!("\nQuestion:\n{question}\n"));
+        out
     }
 
     /// `v` on a slide: mark exactly what the excerpt shows. Completes
@@ -1770,6 +1881,138 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     mid
 }
 
+/// Hand the question to whoever is listening: the command in
+/// DEBRIEF_ASK_CMD (prompt on stdin, run through `sh -c`), or failing
+/// that the clipboard via OSC 52 — works in any modern terminal, even
+/// over ssh.
+fn deliver_ask(prompt: &str) -> String {
+    if let Ok(cmd) = std::env::var("DEBRIEF_ASK_CMD") {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let spawned = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut child) = spawned {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(prompt.as_bytes());
+            }
+            if child.wait().is_ok_and(|s| s.success()) {
+                return "question sent".to_string();
+            }
+        }
+        return "ask command failed — question copied instead".to_string();
+    }
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]52;c;{}\x07", base64(prompt.as_bytes()));
+    let _ = out.flush();
+    "question copied to clipboard".to_string()
+}
+
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// The question input floating over the slide.
+fn draw_ask_popup(frame: &mut Frame, area: Rect, buf: &str, context: &str) {
+    let width = area.width.saturating_sub(8).clamp(20, 80);
+    let [_, mid, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(4),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    let popup = center_h(mid, width);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(context.to_string()).style(Style::new().dim()),
+        Line::from(vec![
+            Span::styled("> ", Style::new().fg(ACCENT)),
+            Span::raw(buf.to_string()),
+            Span::styled("▏", Style::new().fg(ACCENT)),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(ACCENT))
+                .title(Span::styled(
+                    " ask an agent · enter send · esc cancel ",
+                    Style::new().fg(ACCENT),
+                )),
+        ),
+        popup,
+    );
+}
+
+/// The keyboard cheat sheet (`?`). Any key dismisses it.
+fn draw_help(frame: &mut Frame, area: Rect) {
+    let rows: &[(&str, &str)] = &[
+        ("slides", ""),
+        ("n / p", "next / previous slide"),
+        ("v", "mark the shown change seen"),
+        ("a", "ask an agent about this slide"),
+        ("s", "speaker notes: panel → popup → hidden"),
+        ("f", "toggle the file sidebar"),
+        ("tab", "focus the sidebar (j/k · enter · v)"),
+        ("enter", "dive into the full diff"),
+        ("dive", ""),
+        ("n / p", "move the cursor"),
+        ("v / V", "mark line / hunk seen"),
+        ("enter / esc", "back to the slides"),
+        ("everywhere", ""),
+        ("?", "this help"),
+        ("q", "quit · mouse: click and wheel work"),
+    ];
+    let width = 58u16.min(area.width.saturating_sub(4));
+    let height = (rows.len() as u16 + 2).min(area.height);
+    let [_, mid, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(height),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    let popup = center_h(mid, width);
+    frame.render_widget(Clear, popup);
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(key, what)| {
+            if what.is_empty() {
+                Line::from(format!("─ {key} ─")).style(Style::new().dim())
+            } else {
+                Line::from(vec![
+                    Span::styled(format!(" {key:<12}"), Style::new().fg(ACCENT)),
+                    Span::raw((*what).to_string()),
+                ])
+            }
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().dim())
+                .title(Span::styled(" keys ", Style::new().dim())),
+        ),
+        popup,
+    );
+}
+
 fn render_note(frame: &mut Frame, area: Rect, text: &str) {
     frame.render_widget(
         Paragraph::new(text.to_string()).style(Style::new().italic().dim()),
@@ -1827,6 +2070,9 @@ diff --git a/src/lib.rs b/src/lib.rs
             sidebar_scroll: None,
             sidebar_area: Rect::default(),
             focus: Focus::Slides,
+            ask: None,
+            help: false,
+            toast: None,
             sidebar_cursor: 0,
             sidebar_items: Vec::new(),
             strip_boxes: Vec::new(),
@@ -2066,7 +2312,7 @@ diff --git a/f.rs b/f.rs
             },
         ]);
         let s = screen(&mut app);
-        assert!(s.contains(" files"), "sidebar header missing:\n{s}");
+        assert!(s.contains("covers +1/+1 · tab"), "sidebar header missing:\n{s}");
         assert!(s.contains("section one"), "section title missing:\n{s}");
         assert!(s.contains("src/lib.rs +1 -1"), "file row missing:\n{s}");
         let (rect, target) = app
@@ -2328,6 +2574,62 @@ diff --git a/f.rs b/f.rs
         let at: Anchor = "src/lib.rs:13-13".parse().unwrap();
         let lines = app.visible_seen_lines(&at);
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn ask_prompt_carries_slide_context_and_diff() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:10-12".parse().unwrap(),
+            claim: "the claim".into(),
+            notes: vec![Note {
+                line: 11,
+                text: "a note".into(),
+            }],
+            speaker_notes: Some("long prose".into()),
+        }]);
+        let prompt = app.build_ask_prompt("なぜ remove ではなく take?");
+        assert!(prompt.contains("Deck: Test deck (slide 1/1)"), "{prompt}");
+        assert!(prompt.contains("Claim: the claim"), "{prompt}");
+        assert!(prompt.contains("At: src/lib.rs:10-12"), "{prompt}");
+        assert!(prompt.contains("```diff"), "{prompt}");
+        assert!(prompt.contains("-        self.map.remove(&id);"), "{prompt}");
+        assert!(prompt.contains("+        self.map.take(&id);"), "{prompt}");
+        assert!(prompt.contains("- 11: a note"), "{prompt}");
+        assert!(prompt.contains("Speaker notes:\nlong prose"), "{prompt}");
+        assert!(prompt.contains("なぜ remove ではなく take?"), "{prompt}");
+        // Empty question falls back to the default.
+        let prompt = app.build_ask_prompt("  ");
+        assert!(prompt.contains("この変更の意図と動作"), "{prompt}");
+    }
+
+    #[test]
+    fn ask_popup_and_help_overlay_render() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        app.ask = Some("why".into());
+        let s = screen(&mut app);
+        assert!(s.contains(" ask an agent · enter send · esc cancel "), "{s}");
+        assert!(s.contains("> why▏"), "{s}");
+
+        app.ask = None;
+        app.help = true;
+        let s = screen(&mut app);
+        assert!(s.contains(" keys "), "{s}");
+        assert!(s.contains("ask an agent about this slide"), "{s}");
+        assert!(s.contains("mark line / hunk seen"), "{s}");
+    }
+
+    #[test]
+    fn base64_matches_the_spec() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]

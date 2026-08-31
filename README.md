@@ -21,12 +21,27 @@ reports how much of the diff the deck actually covers.
 ## Use
 
 ```
-debrief report.md          # view: n next, p prev, Enter dive into the diff, q quit
-                           # s speaker notes, f file sidebar
-                           # mouse: click outline/sidebar to jump, wheel to move
+debrief report.md          # view — press ? for the full keymap
 debrief check report.md    # validate; exit 1 with exactly what to fix
 debrief schema             # the JSON Schema agents write decks against
 ```
+
+## Asking back
+
+A report you cannot interrogate is a dead end. `a` on any slide opens a
+question box; on Enter the slide's whole context — claim, `file:line`
+anchor, the excerpt as a real diff, notes — plus your question becomes one
+message. If `DEBRIEF_ASK_CMD` is set it is piped to that command
+(`sh -c`, prompt on stdin):
+
+```sh
+# e.g. drop the question straight into an agent's terminal pane:
+export DEBRIEF_ASK_CMD='herdr pane send-text w40:p1 "$(cat)"'
+```
+
+Otherwise it lands on the clipboard via OSC 52, ready to paste at any
+agent. Either way the receiving agent gets the anchors, so it can open
+the code before answering.
 
 ## Review progress
 

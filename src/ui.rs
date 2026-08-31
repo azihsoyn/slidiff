@@ -36,6 +36,7 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
     let outline = outline_of(&deck);
     let git_dir = repo.git_dir();
     let seen = SeenStore::load(git_dir.clone());
+    let hashes = hash_cache(&files);
     // Pick up where the reader left off last time.
     let resumed = deck_key
         .as_deref()
@@ -66,6 +67,7 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
         sidebar_hits: Vec::new(),
         git_dir,
         deck_key,
+        hashes,
     };
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
@@ -164,6 +166,24 @@ struct App {
     git_dir: Option<std::path::PathBuf>,
     /// Identity of the open deck, for the resume record.
     deck_key: Option<String>,
+    /// Per-file (hunk hash, changed count), computed once — hashing the
+    /// whole diff on every draw is what made the sidebar feel slow.
+    hashes: HashMap<String, Vec<(String, usize)>>,
+}
+
+fn hash_cache(files: &[FileDiff]) -> HashMap<String, Vec<(String, usize)>> {
+    files
+        .iter()
+        .map(|fd| {
+            (
+                fd.new_path.clone(),
+                fd.hunks
+                    .iter()
+                    .map(|h| (hunk_hash(h), changed_count(h)))
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 /// A run of slides under one headline slide, and the files they point at.
@@ -295,177 +315,191 @@ impl App {
                 }
             }
             terminal.draw(|frame| self.draw(frame))?;
-            let key = match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => key,
-                Event::Mouse(mouse) => {
-                    let over_sidebar = self.sidebar_area.contains(Position {
-                        x: mouse.column,
-                        y: mouse.row,
-                    });
-                    match mouse.kind {
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            self.on_click(mouse.column, mouse.row);
+            // Handle everything already queued before redrawing once — a
+            // wheel burst is many events but should cost one draw.
+            loop {
+                if self.handle_event(event::read()?)? {
+                    return Ok(());
+                }
+                if !event::poll(std::time::Duration::ZERO)? {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Returns true when the app should quit.
+    fn handle_event(&mut self, event: Event) -> Result<bool> {
+        let key = match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => key,
+            Event::Mouse(mouse) => {
+                let over_sidebar = self.sidebar_area.contains(Position {
+                    x: mouse.column,
+                    y: mouse.row,
+                });
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.on_click(mouse.column, mouse.row);
+                    }
+                    MouseEventKind::ScrollDown => match &mut self.mode {
+                        Mode::Steps if over_sidebar => {
+                            self.sidebar_scroll =
+                                Some(self.sidebar_scroll.unwrap_or(0).saturating_add(3));
                         }
-                        MouseEventKind::ScrollDown => match &mut self.mode {
-                            Mode::Steps if over_sidebar => {
-                                self.sidebar_scroll =
-                                    Some(self.sidebar_scroll.unwrap_or(0).saturating_add(3));
-                            }
-                            Mode::Steps => {
-                                if self.step + 1 < self.deck.steps.len() {
-                                    self.step += 1;
-                                    self.sidebar_scroll = None;
-                                }
-                            }
-                            Mode::Dive { cursor, .. } => *cursor = cursor.saturating_add(3),
-                        },
-                        MouseEventKind::ScrollUp => match &mut self.mode {
-                            Mode::Steps if over_sidebar => {
-                                self.sidebar_scroll =
-                                    Some(self.sidebar_scroll.unwrap_or(0).saturating_sub(3));
-                            }
-                            Mode::Steps => {
-                                self.step = self.step.saturating_sub(1);
+                        Mode::Steps => {
+                            if self.step + 1 < self.deck.steps.len() {
+                                self.step += 1;
                                 self.sidebar_scroll = None;
                             }
-                            Mode::Dive { cursor, .. } => *cursor = cursor.saturating_sub(3),
-                        },
-                        _ => {}
-                    }
-                    continue;
-                }
-                _ => continue,
-            };
-            let ctrl_c = key.code == KeyCode::Char('c')
-                && key.modifiers.contains(KeyModifiers::CONTROL);
-            if ctrl_c {
-                return Ok(());
-            }
-            // The question input swallows every key while open — `q` is a
-            // letter here, not quit.
-            if let Some(buf) = &mut self.ask {
-                match key.code {
-                    KeyCode::Esc => self.ask = None,
-                    KeyCode::Enter => {
-                        let question = self.ask.take().unwrap_or_default();
-                        let prompt = self.build_ask_prompt(&question);
-                        self.toast = Some(deliver_ask(&prompt));
-                    }
-                    KeyCode::Backspace => {
-                        buf.pop();
-                    }
-                    KeyCode::Char(c) => buf.push(c),
+                        }
+                        Mode::Dive { cursor, .. } => *cursor = cursor.saturating_add(3),
+                    },
+                    MouseEventKind::ScrollUp => match &mut self.mode {
+                        Mode::Steps if over_sidebar => {
+                            self.sidebar_scroll =
+                                Some(self.sidebar_scroll.unwrap_or(0).saturating_sub(3));
+                        }
+                        Mode::Steps => {
+                            self.step = self.step.saturating_sub(1);
+                            self.sidebar_scroll = None;
+                        }
+                        Mode::Dive { cursor, .. } => *cursor = cursor.saturating_sub(3),
+                    },
                     _ => {}
                 }
-                continue;
+                return Ok(false);
             }
-            self.toast = None;
-            if self.help {
-                self.help = false;
-                continue;
+            _ => return Ok(false),
+        };
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl_c {
+            return Ok(true);
+        }
+        // The question input swallows every key while open — `q` is a
+        // letter here, not quit.
+        if let Some(buf) = &mut self.ask {
+            match key.code {
+                KeyCode::Esc => self.ask = None,
+                KeyCode::Enter => {
+                    let question = self.ask.take().unwrap_or_default();
+                    let prompt = self.build_ask_prompt(&question);
+                    self.toast = Some(deliver_ask(&prompt));
+                }
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c) => buf.push(c),
+                _ => {}
             }
-            if key.code == KeyCode::Char('?') {
-                self.help = true;
-                continue;
-            }
-            if key.code == KeyCode::Char('q') {
-                return Ok(());
-            }
-            match &mut self.mode {
-                Mode::Steps if self.focus == Focus::Sidebar => match key.code {
-                    KeyCode::Char('n' | 'j') | KeyCode::Down => {
+            return Ok(false);
+        }
+        self.toast = None;
+        if self.help {
+            self.help = false;
+            return Ok(false);
+        }
+        if key.code == KeyCode::Char('?') {
+            self.help = true;
+            return Ok(false);
+        }
+        if key.code == KeyCode::Char('q') {
+            return Ok(true);
+        }
+        match &mut self.mode {
+            Mode::Steps if self.focus == Focus::Sidebar => match key.code {
+                KeyCode::Char('n' | 'j') | KeyCode::Down => {
+                    self.sidebar_cursor = (self.sidebar_cursor + 1)
+                        .min(self.sidebar_items.len().saturating_sub(1));
+                }
+                KeyCode::Char('p' | 'k') | KeyCode::Up => {
+                    self.sidebar_cursor = self.sidebar_cursor.saturating_sub(1);
+                }
+                KeyCode::Enter => {
+                    if let Some(item) = self.sidebar_items.get(self.sidebar_cursor).cloned() {
+                        match item.target {
+                            SideTarget::Step(step) => {
+                                self.step = step;
+                                self.focus = Focus::Slides;
+                                self.sidebar_scroll = None;
+                            }
+                            SideTarget::File(file) => {
+                                self.dive_file = Some(file);
+                                self.mode = Mode::Dive {
+                                    scroll: 0,
+                                    cursor: 0,
+                                };
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('v') => {
+                    if let Some(path) = self
+                        .sidebar_items
+                        .get(self.sidebar_cursor)
+                        .and_then(|i| i.file.clone())
+                        && let Some(fd) = file_diff(&self.files, &path).cloned()
+                    {
+                        self.seen.toggle_file(&fd);
+                        // Marking flows downward here too.
                         self.sidebar_cursor = (self.sidebar_cursor + 1)
                             .min(self.sidebar_items.len().saturating_sub(1));
                     }
-                    KeyCode::Char('p' | 'k') | KeyCode::Up => {
-                        self.sidebar_cursor = self.sidebar_cursor.saturating_sub(1);
-                    }
-                    KeyCode::Enter => {
-                        if let Some(item) = self.sidebar_items.get(self.sidebar_cursor).cloned() {
-                            match item.target {
-                                SideTarget::Step(step) => {
-                                    self.step = step;
-                                    self.focus = Focus::Slides;
-                                    self.sidebar_scroll = None;
-                                }
-                                SideTarget::File(file) => {
-                                    self.dive_file = Some(file);
-                                    self.mode = Mode::Dive {
-                                        scroll: 0,
-                                        cursor: 0,
-                                    };
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Char('v') => {
-                        if let Some(path) = self
-                            .sidebar_items
-                            .get(self.sidebar_cursor)
-                            .and_then(|i| i.file.clone())
-                            && let Some(fd) =
-                                file_diff(&self.files, &path).cloned()
-                        {
-                            self.seen.toggle_file(&fd);
-                            // Marking flows downward here too.
-                            self.sidebar_cursor = (self.sidebar_cursor + 1)
-                                .min(self.sidebar_items.len().saturating_sub(1));
-                        }
-                    }
-                    KeyCode::Char('f') => {
-                        self.files_view = false;
-                        self.focus = Focus::Slides;
-                    }
-                    KeyCode::Tab | KeyCode::Esc => self.focus = Focus::Slides,
-                    _ => {}
-                },
-                Mode::Steps => match key.code {
-                    KeyCode::Char('n' | 'j' | ' ') | KeyCode::Right | KeyCode::Down => {
-                        if self.step + 1 < self.deck.steps.len() {
-                            self.step += 1;
-                            self.sidebar_scroll = None;
-                        }
-                    }
-                    KeyCode::Char('p' | 'k') | KeyCode::Left | KeyCode::Up => {
-                        self.step = self.step.saturating_sub(1);
+                }
+                KeyCode::Char('f') => {
+                    self.files_view = false;
+                    self.focus = Focus::Slides;
+                }
+                KeyCode::Tab | KeyCode::Esc => self.focus = Focus::Slides,
+                _ => {}
+            },
+            Mode::Steps => match key.code {
+                KeyCode::Char('n' | 'j' | ' ') | KeyCode::Right | KeyCode::Down => {
+                    if self.step + 1 < self.deck.steps.len() {
+                        self.step += 1;
                         self.sidebar_scroll = None;
                     }
-                    KeyCode::Char('s') => self.notes_view = self.notes_view.next(),
-                    KeyCode::Char('f') => self.files_view = !self.files_view,
-                    KeyCode::Char('v') => self.slide_toggle_seen(),
-                    KeyCode::Char('a') => self.ask = Some(String::new()),
-                    KeyCode::Tab => {
-                        if self.files_view && !self.sidebar_items.is_empty() {
-                            self.focus = Focus::Sidebar;
-                        }
+                }
+                KeyCode::Char('p' | 'k') | KeyCode::Left | KeyCode::Up => {
+                    self.step = self.step.saturating_sub(1);
+                    self.sidebar_scroll = None;
+                }
+                KeyCode::Char('s') => self.notes_view = self.notes_view.next(),
+                KeyCode::Char('f') => self.files_view = !self.files_view,
+                KeyCode::Char('v') => self.slide_toggle_seen(),
+                KeyCode::Char('a') => self.ask = Some(String::new()),
+                KeyCode::Tab => {
+                    if self.files_view && !self.sidebar_items.is_empty() {
+                        self.focus = Focus::Sidebar;
                     }
-                    KeyCode::Enter => self.enter_dive(),
-                    KeyCode::Esc => {
-                        if self.notes_view == NotesView::Popup {
-                            self.notes_view = NotesView::Panel;
-                        } else {
-                            return Ok(());
-                        }
+                }
+                KeyCode::Enter => self.enter_dive(),
+                KeyCode::Esc => {
+                    if self.notes_view == NotesView::Popup {
+                        self.notes_view = NotesView::Panel;
+                    } else {
+                        return Ok(true);
                     }
-                    _ => {}
-                },
-                Mode::Dive { cursor, .. } => match key.code {
-                    KeyCode::Char('n' | 'j') | KeyCode::Down => {
-                        *cursor = cursor.saturating_add(1);
-                    }
-                    KeyCode::Char('p' | 'k') | KeyCode::Up => {
-                        *cursor = cursor.saturating_sub(1);
-                    }
-                    KeyCode::Char('v') => self.dive_toggle_line(),
-                    KeyCode::Char('V') => self.dive_toggle_hunk(),
-                    KeyCode::Enter | KeyCode::Esc => {
-                        self.mode = Mode::Steps;
-                        self.dive_file = None;
-                    }
-                    _ => {}
-                },
-            }
+                }
+                _ => {}
+            },
+            Mode::Dive { cursor, .. } => match key.code {
+                KeyCode::Char('n' | 'j') | KeyCode::Down => {
+                    *cursor = cursor.saturating_add(1);
+                }
+                KeyCode::Char('p' | 'k') | KeyCode::Up => {
+                    *cursor = cursor.saturating_sub(1);
+                }
+                KeyCode::Char('v') => self.dive_toggle_line(),
+                KeyCode::Char('V') => self.dive_toggle_hunk(),
+                KeyCode::Enter | KeyCode::Esc => {
+                    self.mode = Mode::Steps;
+                    self.dive_file = None;
+                }
+                _ => {}
+            },
         }
+        Ok(false)
     }
 
     fn current(&self) -> &Step {
@@ -823,6 +857,7 @@ impl App {
         });
 
         // A file row: shortened path, +/- counts, seen progress.
+        let hashes = &self.hashes;
         let file_row = |path: &str,
                         indent: &str,
                         is_current: bool,
@@ -832,7 +867,10 @@ impl App {
          -> Line<'static> {
             let fd = file_diff(files, path);
             let counts = fd.map(|fd| (fd.added(), fd.deleted()));
-            let progress = fd.map(|fd| seen.progress_for(fd)).unwrap_or((0, 0));
+            let progress = hashes
+                .get(path)
+                .map(|pairs| seen.progress_cached(path, pairs))
+                .unwrap_or((0, 0));
             let seen_text = match progress {
                 (_, 0) => String::new(),
                 (s, t) if s == t => " ✓".to_string(),
@@ -1079,13 +1117,11 @@ impl App {
             return;
         }
         // Which of the shown changed lines are already marked seen.
-        let hashes: Vec<String> = file_diff(&self.files, &at.file)
-            .map(|fd| fd.hunks.iter().map(hunk_hash).collect())
-            .unwrap_or_default();
+        let hashes = self.hashes_of(&at.file);
         let seen_flags: Vec<bool> = rows
             .iter()
             .map(|r| match (r.hunk_idx, r.changed_idx) {
-                (Some(h), Some(i)) => self.seen.is_seen(&at.file, &hashes[h], i),
+                (Some(h), Some(i)) => self.seen.is_seen(&at.file, &hashes[h].0, i),
                 _ => false,
             })
             .collect();
@@ -1128,13 +1164,10 @@ impl App {
     /// The seen addresses of the changed lines the current excerpt shows.
     fn visible_seen_lines(&mut self, at: &Anchor) -> Vec<(String, usize)> {
         let rows = self.rows_for(at);
-        let Some(fd) = file_diff(&self.files, &at.file) else {
-            return Vec::new();
-        };
-        let hashes: Vec<String> = fd.hunks.iter().map(hunk_hash).collect();
+        let hashes = self.hashes_of(&at.file);
         rows.iter()
             .filter_map(|r| match (r.hunk_idx, r.changed_idx) {
-                (Some(h), Some(i)) => Some((hashes[h].clone(), i)),
+                (Some(h), Some(i)) => Some((hashes.get(h)?.0.clone(), i)),
                 _ => None,
             })
             .collect()
@@ -1369,9 +1402,12 @@ impl App {
             let Some(fd) = file_diff(&self.files, &path) else {
                 continue;
             };
-            for hunk in &fd.hunks {
-                let hash = hunk_hash(hunk);
-                let total = changed_count(hunk);
+            let pairs = self.hashes_of(&fd.new_path);
+            for (hunk_idx, hunk) in fd.hunks.iter().enumerate() {
+                let (hash, total) = match pairs.get(hunk_idx) {
+                    Some((h, c)) => (h.clone(), *c),
+                    None => (hunk_hash(hunk), changed_count(hunk)),
+                };
                 meta.push(DiveMeta::header());
                 let mut changed_idx = 0;
                 for line in &hunk.lines {
@@ -1439,11 +1475,15 @@ impl App {
         }
     }
 
+    fn hashes_of(&self, file: &str) -> &[(String, usize)] {
+        self.hashes.get(file).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// (seen, total) changed lines across the whole diff.
     fn seen_overall(&self) -> (usize, usize) {
         self.files
             .iter()
-            .map(|fd| self.seen.progress_for(fd))
+            .map(|fd| self.seen.progress_cached(&fd.new_path, self.hashes_of(&fd.new_path)))
             .fold((0, 0), |(s, t), (a, b)| (s + a, t + b))
     }
 
@@ -1471,14 +1511,15 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         for fd in shown {
             let lang = Lang::from_path(&fd.new_path);
-            for hunk in &fd.hunks {
-                let hash = hunk_hash(hunk);
-                let (h_seen, h_total) = (
-                    (0..changed_count(hunk))
-                        .filter(|&i| self.seen.is_seen(&fd.new_path, &hash, i))
-                        .count(),
-                    changed_count(hunk),
-                );
+            let pairs = self.hashes.get(fd.new_path.as_str());
+            for (hunk_idx, hunk) in fd.hunks.iter().enumerate() {
+                let (hash, h_total) = match pairs.and_then(|p| p.get(hunk_idx)) {
+                    Some((h, c)) => (h.clone(), *c),
+                    None => (hunk_hash(hunk), changed_count(hunk)),
+                };
+                let h_seen = (0..h_total)
+                    .filter(|&i| self.seen.is_seen(&fd.new_path, &hash, i))
+                    .count();
                 let mut header = format!("── {}", fd.new_path);
                 if !hunk.section.is_empty() {
                     header.push_str(&format!(" · {}", hunk.section));
@@ -2064,6 +2105,7 @@ diff --git a/src/lib.rs b/src/lib.rs
 
     fn app_with(steps: Vec<Step>) -> App {
         let files = parse_unified(SAMPLE);
+        let hashes = hash_cache(&files);
         let deck = Deck {
             title: "Test deck".into(),
             base: None,
@@ -2098,6 +2140,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             strip_boxes: Vec::new(),
             git_dir: None,
             deck_key: None,
+            hashes,
         }
     }
 

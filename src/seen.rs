@@ -65,6 +65,13 @@ impl SeenStore {
         !all_seen
     }
 
+    /// [`Self::progress_for`] against precomputed (hash, changed) pairs,
+    /// so hot paths never rehash the diff.
+    pub fn progress_cached(&self, file: &str, hunks: &[(String, usize)]) -> (usize, usize) {
+        self.0
+            .progress(file, hunks.iter().map(|(h, c)| (h.as_str(), *c)))
+    }
+
     /// (seen, total) changed lines for one file, counting only marks whose
     /// hunk hash still exists in the current diff.
     pub fn progress_for(&self, fd: &FileDiff) -> (usize, usize) {

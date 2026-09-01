@@ -935,18 +935,14 @@ impl App {
                         indent: &str,
                         is_current: bool,
                         dim_row: bool,
-                        seen: &SeenStore,
-                        files: &[FileDiff]|
+                        seen: &SeenStore|
          -> Line<'static> {
-            let fd = file_diff(files, path);
-            let counts = fd.map(|fd| (fd.added(), fd.deleted()));
             let (s, t) = hashes
                 .get(path)
                 .map(|pairs| seen.progress_cached(path, pairs))
                 .unwrap_or((0, 0));
-            // Three facts per file: what the deck explains (and whether
-            // that part is seen), the file's whole change, and how much
-            // unexplained change is still unseen.
+            // Words, not glyphs: "deck 5/9" is the deck-explained part and
+            // its progress, "rest 374" the unexplained lines still unseen.
             let mut suffix: Vec<Span<'static>> = Vec::new();
             if t > 0 {
                 if s == t {
@@ -965,32 +961,26 @@ impl App {
                     if cov_tot > 0 {
                         if cov_seen == cov_tot {
                             suffix.push(Span::styled(
-                                format!(" ◆{cov_tot}✓"),
+                                format!(" deck {cov_tot}✓"),
                                 Style::new().green(),
                             ));
                         } else {
                             suffix.push(Span::styled(
-                                format!(" ◆{cov_seen}/{cov_tot}"),
+                                format!(" deck {cov_seen}/{cov_tot}"),
                                 Style::new().fg(ACCENT),
                             ));
                         }
                     }
                     if unexplained_unseen > 0 {
                         suffix.push(Span::styled(
-                            format!(" {unexplained_unseen}"),
+                            format!(" rest {unexplained_unseen}"),
                             Style::new().yellow(),
                         ));
                     }
                 }
             }
-            let count_text = match counts {
-                Some((a, d)) if d > 0 => format!(" +{a} -{d}"),
-                Some((a, _)) => format!(" +{a}"),
-                None => String::new(),
-            };
             let suffix_w: usize = suffix.iter().map(|s| display_width(&s.content)).sum();
-            let name_w = inner_w
-                .saturating_sub(count_text.len() + suffix_w + indent.len() + 1);
+            let name_w = inner_w.saturating_sub(suffix_w + indent.len() + 1);
             let marker = if is_current { "▎" } else { " " };
             let dim_if = |s: Style| if dim_row { s.add_modifier(Modifier::DIM) } else { s };
             let mut spans = vec![
@@ -1004,12 +994,6 @@ impl App {
                     dim_if(if is_current { Style::new().bold() } else { Style::new() }),
                 ),
             ];
-            if let Some((a, d)) = counts {
-                spans.push(Span::styled(format!(" +{a}"), Style::new().green().dim()));
-                if d > 0 {
-                    spans.push(Span::styled(format!(" -{d}"), Style::new().red().dim()));
-                }
-            }
             spans.extend(suffix);
             Line::from(spans)
         };
@@ -1078,7 +1062,7 @@ impl App {
                     file: Some(path.clone()),
                 });
                 rows.push((
-                    file_row(path, file_indent, is_current, false, &self.seen, &self.files),
+                    file_row(path, file_indent, is_current, false, &self.seen),
                     Some(SideTarget::Step(*first_step)),
                     is_current,
                 ));
@@ -1119,7 +1103,7 @@ impl App {
                     file: Some(fd.new_path.clone()),
                 });
                 rows.push((
-                    file_row(&fd.new_path, "  ", is_current, true, &self.seen, &self.files),
+                    file_row(&fd.new_path, "  ", is_current, true, &self.seen),
                     Some(SideTarget::File(fd.new_path.clone())),
                     is_current,
                 ));
@@ -2162,8 +2146,8 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("tab", "focus the sidebar (j/k · enter · v)"),
         ("enter", "dive into the full diff"),
         ("file list", ""),
-        ("◆ 5/9", "deck-explained lines: seen / shown"),
-        ("yellow n", "unexplained lines still unseen"),
+        ("deck 5/9", "deck-explained lines: seen / shown"),
+        ("rest n", "unexplained lines still unseen"),
         ("✓", "whole file seen"),
         ("dive", ""),
         ("n / p", "move the cursor"),
@@ -2521,7 +2505,7 @@ diff --git a/f.rs b/f.rs
         let s = screen(&mut app);
         assert!(s.contains("covers +1/+1 · tab"), "sidebar header missing:\n{s}");
         assert!(s.contains("section one"), "section title missing:\n{s}");
-        assert!(s.contains("src/lib.rs +1 -1"), "file row missing:\n{s}");
+        assert!(s.contains("src/lib.rs deck 0/2"), "file row missing:\n{s}");
         let (rect, target) = app
             .sidebar_hits
             .iter()
@@ -2718,7 +2702,7 @@ diff --git a/f.rs b/f.rs
         // (with its own progress) and unexplained-unseen parts.
         app.mode = Mode::Steps;
         let s = screen(&mut app);
-        assert!(s.contains("◆1/2"), "deck-explained progress missing:\n{s}");
+        assert!(s.contains("deck 1/2"), "deck-explained progress missing:\n{s}");
 
         // V on a row of the same hunk marks the rest, toggling to full.
         app.mode = Mode::Dive { scroll: 0, cursor };
@@ -2757,7 +2741,7 @@ diff --git a/f.rs b/f.rs
         app.mode = Mode::Steps;
         app.dive_file = None;
         let s = screen(&mut app);
-        assert!(s.contains("-1 ✓"), "sidebar checkmark missing:\n{s}");
+        assert!(s.contains("src/lib.rs ✓"), "sidebar checkmark missing:\n{s}");
     }
 
     #[test]

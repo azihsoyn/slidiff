@@ -55,7 +55,6 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
         file_cache: HashMap::new(),
         seen,
         dive_file: None,
-        sidebar_scroll: None,
         sidebar_area: Rect::default(),
         focus: Focus::Slides,
         ask: None,
@@ -143,8 +142,6 @@ struct App {
     seen: SeenStore,
     /// When set, the dive shows this file instead of the current step's.
     dive_file: Option<String>,
-    /// Manual sidebar scroll (wheel); None follows the current slide.
-    sidebar_scroll: Option<usize>,
     /// Where the sidebar was last drawn, for wheel routing.
     sidebar_area: Rect,
     /// Keyboard focus on the steps screen; Tab switches.
@@ -342,26 +339,18 @@ impl App {
                         self.on_click(mouse.column, mouse.row);
                     }
                     MouseEventKind::ScrollDown => match &mut self.mode {
-                        Mode::Steps if over_sidebar => {
-                            self.sidebar_scroll =
-                                Some(self.sidebar_scroll.unwrap_or(0).saturating_add(3));
-                        }
+                        Mode::Steps if over_sidebar => self.sidebar_move(3),
                         Mode::Steps => {
                             if self.step + 1 < self.deck.steps.len() {
                                 self.step += 1;
-                                self.sidebar_scroll = None;
                             }
                         }
                         Mode::Dive { cursor, .. } => *cursor = cursor.saturating_add(3),
                     },
                     MouseEventKind::ScrollUp => match &mut self.mode {
-                        Mode::Steps if over_sidebar => {
-                            self.sidebar_scroll =
-                                Some(self.sidebar_scroll.unwrap_or(0).saturating_sub(3));
-                        }
+                        Mode::Steps if over_sidebar => self.sidebar_move(-3),
                         Mode::Steps => {
                             self.step = self.step.saturating_sub(1);
-                            self.sidebar_scroll = None;
                         }
                         Mode::Dive { cursor, .. } => *cursor = cursor.saturating_sub(3),
                     },
@@ -421,7 +410,6 @@ impl App {
                             SideTarget::Step(step) => {
                                 self.step = step;
                                 self.focus = Focus::Slides;
-                                self.sidebar_scroll = None;
                             }
                             SideTarget::File(file) => {
                                 self.dive_file = Some(file);
@@ -459,37 +447,15 @@ impl App {
                 KeyCode::Char('n' | 'j' | ' ') | KeyCode::Right => {
                     if self.step + 1 < self.deck.steps.len() {
                         self.step += 1;
-                        self.sidebar_scroll = None;
                     }
                 }
                 KeyCode::Char('p' | 'k') | KeyCode::Left => {
                     self.step = self.step.saturating_sub(1);
-                    self.sidebar_scroll = None;
                 }
                 // ↑/↓ go straight into the file list — the sidebar is the
-                // vertical axis, slides the horizontal one. Landing row is
-                // the current slide's file, so the jump reads as "step off
-                // the slide into the list".
-                KeyCode::Down | KeyCode::Up => {
-                    if self.files_view && !self.sidebar_items.is_empty() {
-                        self.focus = Focus::Sidebar;
-                        let current = self.current().anchor().map(|a| a.file.clone());
-                        let base = current
-                            .as_deref()
-                            .and_then(|f| {
-                                self.sidebar_items
-                                    .iter()
-                                    .position(|i| i.file.as_deref() == Some(f))
-                            })
-                            .unwrap_or(self.sidebar_cursor);
-                        let last = self.sidebar_items.len() - 1;
-                        self.sidebar_cursor = if key.code == KeyCode::Down {
-                            (base + 1).min(last)
-                        } else {
-                            base.saturating_sub(1)
-                        };
-                    }
-                }
+                // vertical axis, slides the horizontal one.
+                KeyCode::Down => self.sidebar_move(1),
+                KeyCode::Up => self.sidebar_move(-1),
                 KeyCode::Char('s') => self.notes_view = self.notes_view.next(),
                 KeyCode::Char('f') => self.files_view = !self.files_view,
                 KeyCode::Char('v') => self.slide_toggle_seen(),
@@ -530,6 +496,31 @@ impl App {
 
     fn current(&self) -> &Step {
         &self.deck.steps[self.step]
+    }
+
+    /// Move the file-list cursor, taking focus if the slides had it.
+    /// Entry lands relative to the current slide's file, so stepping off
+    /// the slide into the list reads as one continuous motion.
+    fn sidebar_move(&mut self, delta: isize) {
+        if !self.files_view || self.sidebar_items.is_empty() {
+            return;
+        }
+        let base = if self.focus == Focus::Sidebar {
+            self.sidebar_cursor as isize
+        } else {
+            self.focus = Focus::Sidebar;
+            self.current()
+                .anchor()
+                .map(|a| a.file.clone())
+                .and_then(|f| {
+                    self.sidebar_items
+                        .iter()
+                        .position(|i| i.file.as_deref() == Some(f.as_str()))
+                })
+                .unwrap_or(self.sidebar_cursor) as isize
+        };
+        let last = self.sidebar_items.len() as isize - 1;
+        self.sidebar_cursor = (base + delta).clamp(0, last) as usize;
     }
 
     fn file_lines(&mut self, path: &str) -> Option<&[String]> {
@@ -645,12 +636,18 @@ impl App {
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
         let step = self.current();
-        let mut left = format!(" {}/{} · {}", self.step + 1, self.deck.steps.len(), step.type_name());
+        // seen before the anchor: a long path may truncate, the progress
+        // meter may not.
+        let (s, t) = self.seen_overall();
+        let mut left = format!(
+            " {}/{} · seen {s}/{t} · {}",
+            self.step + 1,
+            self.deck.steps.len(),
+            step.type_name()
+        );
         if let Some(at) = step.anchor() {
             left.push_str(&format!(" · {at}"));
         }
-        let (s, t) = self.seen_overall();
-        left.push_str(&format!(" · seen {s}/{t}"));
         if let Some(toast) = &self.toast {
             left.push_str(&format!("  ▸ {toast}"));
         }
@@ -827,7 +824,6 @@ impl App {
         let pos = Position { x, y };
         if let Some(&(_, step)) = self.strip_boxes.iter().find(|(rect, _)| rect.contains(pos)) {
             self.step = step;
-            self.sidebar_scroll = None;
             return;
         }
         let hit = self
@@ -838,7 +834,6 @@ impl App {
         match hit {
             Some(SideTarget::Step(step)) => {
                 self.step = step;
-                self.sidebar_scroll = None;
             }
             Some(SideTarget::File(file)) => {
                 self.dive_file = Some(file);
@@ -1048,19 +1043,13 @@ impl App {
         };
         self.sidebar_items = items;
 
-        // Keep the focused row in view unless the reader wheel-scrolled.
+        // Keep the focused row in view.
         let height = usize::from(area.height);
-        let auto = if rows.len() <= height {
+        let offset = if rows.len() <= height {
             0
         } else {
             focus_row.saturating_sub(height / 2).min(rows.len() - height)
         };
-        let offset = if self.focus == Focus::Sidebar {
-            auto
-        } else {
-            self.sidebar_scroll.unwrap_or(auto)
-        }
-        .min(rows.len().saturating_sub(height.max(1)));
         for (i, (line, target, _)) in rows.into_iter().enumerate().skip(offset).take(height) {
             let y = area.y + (i - offset) as u16;
             let rect = Rect {
@@ -2156,7 +2145,6 @@ diff --git a/src/lib.rs b/src/lib.rs
             file_cache: HashMap::new(),
             seen: SeenStore::in_memory(),
             dive_file: None,
-            sidebar_scroll: None,
             sidebar_area: Rect::default(),
             focus: Focus::Slides,
             ask: None,

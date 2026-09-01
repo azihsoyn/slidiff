@@ -92,7 +92,7 @@ enum SideTarget {
 }
 
 /// Where key input goes on the steps screen.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Focus {
     Slides,
     Sidebar,
@@ -450,19 +450,45 @@ impl App {
                     self.files_view = false;
                     self.focus = Focus::Slides;
                 }
-                KeyCode::Tab | KeyCode::Esc => self.focus = Focus::Slides,
+                KeyCode::Tab | KeyCode::Esc | KeyCode::Left | KeyCode::Right => {
+                    self.focus = Focus::Slides;
+                }
                 _ => {}
             },
             Mode::Steps => match key.code {
-                KeyCode::Char('n' | 'j' | ' ') | KeyCode::Right | KeyCode::Down => {
+                KeyCode::Char('n' | 'j' | ' ') | KeyCode::Right => {
                     if self.step + 1 < self.deck.steps.len() {
                         self.step += 1;
                         self.sidebar_scroll = None;
                     }
                 }
-                KeyCode::Char('p' | 'k') | KeyCode::Left | KeyCode::Up => {
+                KeyCode::Char('p' | 'k') | KeyCode::Left => {
                     self.step = self.step.saturating_sub(1);
                     self.sidebar_scroll = None;
+                }
+                // ↑/↓ go straight into the file list — the sidebar is the
+                // vertical axis, slides the horizontal one. Landing row is
+                // the current slide's file, so the jump reads as "step off
+                // the slide into the list".
+                KeyCode::Down | KeyCode::Up => {
+                    if self.files_view && !self.sidebar_items.is_empty() {
+                        self.focus = Focus::Sidebar;
+                        let current = self.current().anchor().map(|a| a.file.clone());
+                        let base = current
+                            .as_deref()
+                            .and_then(|f| {
+                                self.sidebar_items
+                                    .iter()
+                                    .position(|i| i.file.as_deref() == Some(f))
+                            })
+                            .unwrap_or(self.sidebar_cursor);
+                        let last = self.sidebar_items.len() - 1;
+                        self.sidebar_cursor = if key.code == KeyCode::Down {
+                            (base + 1).min(last)
+                        } else {
+                            base.saturating_sub(1)
+                        };
+                    }
                 }
                 KeyCode::Char('s') => self.notes_view = self.notes_view.next(),
                 KeyCode::Char('f') => self.files_view = !self.files_view,
@@ -2025,7 +2051,8 @@ fn draw_ask_popup(frame: &mut Frame, area: Rect, buf: &str, context: &str) {
 fn draw_help(frame: &mut Frame, area: Rect) {
     let rows: &[(&str, &str)] = &[
         ("slides", ""),
-        ("n / p", "next / previous slide"),
+        ("n / p, ← →", "next / previous slide"),
+        ("↑ / ↓", "walk the file list, incl. not in deck"),
         ("v", "mark the shown change seen"),
         ("a", "ask an agent about this slide"),
         ("s", "speaker notes: panel → popup → hidden"),
@@ -2485,6 +2512,39 @@ diff --git a/f.rs b/f.rs
         // sub b has not started yet, so its band is not the lit one; its
         // headline is still clickable via the strip.
         assert!(app.strip_boxes.iter().any(|(_, t)| *t == 4));
+    }
+
+    #[test]
+    fn down_arrow_steps_into_the_file_list_at_the_current_file() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        screen(&mut app); // populate sidebar_items
+        assert!(app
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Down,
+                KeyModifiers::NONE,
+            )))
+            .is_ok());
+        assert_eq!(app.focus, Focus::Sidebar);
+        // Landed relative to the current file's row and stepped once.
+        let base = app
+            .sidebar_items
+            .iter()
+            .position(|i| i.file.as_deref() == Some("src/lib.rs"))
+            .unwrap();
+        assert_eq!(app.sidebar_cursor, (base + 1).min(app.sidebar_items.len() - 1));
+        // ← returns to the slides.
+        assert!(app
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::NONE,
+            )))
+            .is_ok());
+        assert_eq!(app.focus, Focus::Slides);
     }
 
     #[test]

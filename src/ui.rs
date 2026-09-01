@@ -902,21 +902,28 @@ impl App {
          -> Line<'static> {
             let fd = file_diff(files, path);
             let counts = fd.map(|fd| (fd.added(), fd.deleted()));
-            let progress = hashes
+            let (s, t) = hashes
                 .get(path)
                 .map(|pairs| seen.progress_cached(path, pairs))
                 .unwrap_or((0, 0));
-            let seen_text = match progress {
-                (_, 0) => String::new(),
-                (s, t) if s == t => " ✓".to_string(),
-                (0, _) => String::new(),
-                (s, t) => format!(" {s}/{t}"),
+            // What matters for the reader is the remainder, not the ratio:
+            // "9/284" reads as progress and hides the 275 still to look at.
+            let seen_text = if t == 0 {
+                String::new()
+            } else if s == t {
+                " ✓".to_string()
+            } else if s > 0 {
+                format!(" {} left", t - s)
+            } else {
+                String::new()
             };
-            let count_len = counts
-                .map(|(a, d)| format!(" +{a} -{d}").len())
-                .unwrap_or(0)
-                + seen_text.len();
-            let name_w = inner_w.saturating_sub(count_len + indent.len() + 1);
+            let count_text = match counts {
+                Some((a, d)) if d > 0 => format!(" +{a} -{d}"),
+                Some((a, _)) => format!(" +{a}"),
+                None => String::new(),
+            };
+            let name_w = inner_w
+                .saturating_sub(count_text.len() + seen_text.len() + indent.len() + 1);
             let marker = if is_current { "▎" } else { " " };
             let dim_if = |s: Style| if dim_row { s.add_modifier(Modifier::DIM) } else { s };
             let mut spans = vec![
@@ -932,13 +939,15 @@ impl App {
             ];
             if let Some((a, d)) = counts {
                 spans.push(Span::styled(format!(" +{a}"), Style::new().green().dim()));
-                spans.push(Span::styled(format!(" -{d}"), Style::new().red().dim()));
+                if d > 0 {
+                    spans.push(Span::styled(format!(" -{d}"), Style::new().red().dim()));
+                }
             }
             if !seen_text.is_empty() {
                 let style = if seen_text == " ✓" {
                     Style::new().green()
                 } else {
-                    Style::new().dim()
+                    Style::new().yellow()
                 };
                 spans.push(Span::styled(seen_text, style));
             }
@@ -2632,6 +2641,10 @@ diff --git a/f.rs b/f.rs
         // The cursor advanced past the toggled line.
         let Mode::Dive { cursor: after, .. } = app.mode else { panic!() };
         assert!(after > cursor);
+        // Back on the slides, the sidebar states the remainder, not a ratio.
+        app.mode = Mode::Steps;
+        let s = screen(&mut app);
+        assert!(s.contains("1 left"), "remainder missing:\n{s}");
 
         // V on a row of the same hunk marks the rest, toggling to full.
         app.mode = Mode::Dive { scroll: 0, cursor };

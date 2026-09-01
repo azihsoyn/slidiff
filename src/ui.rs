@@ -52,6 +52,7 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
         mode: Mode::Steps,
         notes_view: NotesView::Panel,
         files_view: true,
+        hide_seen: false,
         file_cache: HashMap::new(),
         seen,
         dive_file: None,
@@ -135,6 +136,9 @@ struct App {
     notes_view: NotesView,
     /// File sidebar on the left, toggled with `f`; hidden on narrow panes.
     files_view: bool,
+    /// `h`: drop fully seen files from the list — the endgame view where
+    /// only what is left to review remains.
+    hide_seen: bool,
     /// The deck's sections and the files each one points at.
     outline: Vec<Section>,
     file_cache: HashMap<String, Option<Vec<String>>>,
@@ -438,6 +442,7 @@ impl App {
                     self.files_view = false;
                     self.focus = Focus::Slides;
                 }
+                KeyCode::Char('h') => self.hide_seen = !self.hide_seen,
                 KeyCode::Tab | KeyCode::Esc | KeyCode::Left | KeyCode::Right => {
                     self.focus = Focus::Slides;
                 }
@@ -458,6 +463,7 @@ impl App {
                 KeyCode::Up => self.sidebar_move(-1),
                 KeyCode::Char('s') => self.notes_view = self.notes_view.next(),
                 KeyCode::Char('f') => self.files_view = !self.files_view,
+                KeyCode::Char('h') => self.hide_seen = !self.hide_seen,
                 KeyCode::Char('v') => self.slide_toggle_seen(),
                 KeyCode::Char('a') => self.ask = Some(String::new()),
                 KeyCode::Tab => {
@@ -935,15 +941,21 @@ impl App {
         let mut rows: Vec<(Line, Option<SideTarget>, bool)> = Vec::new();
         let mut items: Vec<SideItem> = Vec::new();
         rows.push((
-            Line::from(if self.focus == Focus::Sidebar {
-                " j/k · enter open · v seen".to_string()
-            } else {
-                format!(" {} · tab", self.coverage.summary_short())
-            })
-            .style(Style::new().dim()),
+            Line::default(), // header, filled in once the hidden count is known
             None,
             false,
         ));
+        let seen_store = &self.seen;
+        let fully_seen = |path: &str| -> bool {
+            hashes
+                .get(path)
+                .map(|pairs| {
+                    let (s, t) = seen_store.progress_cached(path, pairs);
+                    t > 0 && s == t
+                })
+                .unwrap_or(false)
+        };
+        let mut hidden = 0usize;
         for (si, section) in self.outline.iter().enumerate() {
             if !section.title.is_empty() {
                 if section.level == 1 {
@@ -978,6 +990,10 @@ impl App {
             }
             let file_indent = if section.level == 1 { "  " } else { "    " };
             for (path, first_step) in &section.files {
+                if self.hide_seen && fully_seen(path) {
+                    hidden += 1;
+                    continue;
+                }
                 let is_current = current_file.as_deref() == Some(path.as_str());
                 items.push(SideItem {
                     row: rows.len(),
@@ -1015,6 +1031,10 @@ impl App {
                 false,
             ));
             for fd in rest {
+                if self.hide_seen && fully_seen(&fd.new_path) {
+                    hidden += 1;
+                    continue;
+                }
                 let is_current = self.dive_file.as_deref() == Some(fd.new_path.as_str());
                 items.push(SideItem {
                     row: rows.len(),
@@ -1028,6 +1048,21 @@ impl App {
                 ));
             }
         }
+
+        rows[0].0 = Line::from(format!(
+            "{}{}",
+            if self.focus == Focus::Sidebar {
+                " j/k · enter open · v seen".to_string()
+            } else {
+                format!(" {} · tab", self.coverage.summary_short())
+            },
+            if self.hide_seen {
+                format!(" · hiding {hidden} ✓")
+            } else {
+                String::new()
+            },
+        ))
+        .style(Style::new().dim());
 
         // The focused row: the keyboard cursor when the sidebar has focus,
         // otherwise the current slide's file.
@@ -2046,6 +2081,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("a", "ask an agent about this slide"),
         ("s", "speaker notes: panel → popup → hidden"),
         ("f", "toggle the file sidebar"),
+        ("h", "hide fully seen files"),
         ("tab", "focus the sidebar (j/k · enter · v)"),
         ("enter", "dive into the full diff"),
         ("dive", ""),
@@ -2133,6 +2169,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             deck,
             outline,
             files_view: true,
+            hide_seen: false,
             sidebar_hits: Vec::new(),
             repo: Repo {
                 root: PathBuf::from("/nonexistent"),
@@ -2743,6 +2780,32 @@ diff --git a/f.rs b/f.rs
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn h_hides_fully_seen_files_from_the_sidebar() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        let fd = file_diff(&app.files, "src/lib.rs").cloned().unwrap();
+        app.seen.toggle_file(&fd);
+        let s = screen(&mut app);
+        assert!(s.contains("src/lib.rs"), "{s}");
+
+        app.hide_seen = true;
+        let s = screen(&mut app);
+        assert!(
+            !s.contains("▎src/lib.rs") && !s.contains(" src/lib.rs +1"),
+            "fully seen file should be hidden:\n{s}"
+        );
+        assert!(s.contains("hiding 1 ✓"), "hidden count missing:\n{s}");
+        assert!(
+            !app.sidebar_items.iter().any(|i| i.file.is_some()),
+            "hidden file must leave the keyboard list too"
+        );
     }
 
     #[test]

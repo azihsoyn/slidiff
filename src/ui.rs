@@ -433,9 +433,17 @@ impl App {
                         && let Some(fd) = file_diff(&self.files, &path).cloned()
                     {
                         self.seen.toggle_file(&fd);
-                        // Marking flows downward here too.
-                        self.sidebar_cursor = (self.sidebar_cursor + 1)
-                            .min(self.sidebar_items.len().saturating_sub(1));
+                        // Marking flows downward — unless hide-seen will
+                        // drop this row, in which case the vanishing row
+                        // is the advance and the cursor stays put.
+                        let (s, t) = self
+                            .seen
+                            .progress_cached(&path, self.hashes_of(&path));
+                        let vanishes = self.hide_seen && t > 0 && s == t;
+                        if !vanishes {
+                            self.sidebar_cursor = (self.sidebar_cursor + 1)
+                                .min(self.sidebar_items.len().saturating_sub(1));
+                        }
                     }
                 }
                 KeyCode::Char('f') => {
@@ -2805,6 +2813,54 @@ diff --git a/f.rs b/f.rs
         assert!(
             !app.sidebar_items.iter().any(|i| i.file.is_some()),
             "hidden file must leave the keyboard list too"
+        );
+    }
+
+    #[test]
+    fn v_in_hide_mode_does_not_advance_past_the_vanishing_row() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        app.hide_seen = true;
+        screen(&mut app); // populate items
+        app.focus = Focus::Sidebar;
+        app.sidebar_cursor = app
+            .sidebar_items
+            .iter()
+            .position(|i| i.file.as_deref() == Some("src/lib.rs"))
+            .unwrap();
+        let before = app.sidebar_cursor;
+        assert!(app
+            .handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::NONE,
+            )))
+            .is_ok());
+        // Marked fully seen; the row will vanish, so the cursor stays.
+        assert_eq!(app.sidebar_cursor, before);
+        let fd = file_diff(&app.files, "src/lib.rs").cloned().unwrap();
+        assert_eq!(app.seen.progress_for(&fd), (2, 2));
+
+        // With hide off, the same v advances as before.
+        app.hide_seen = false;
+        screen(&mut app);
+        app.focus = Focus::Sidebar;
+        app.sidebar_cursor = app
+            .sidebar_items
+            .iter()
+            .position(|i| i.file.as_deref() == Some("src/lib.rs"))
+            .unwrap();
+        let before = app.sidebar_cursor;
+        let _ = app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.sidebar_cursor,
+            (before + 1).min(app.sidebar_items.len() - 1)
         );
     }
 

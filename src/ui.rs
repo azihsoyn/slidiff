@@ -37,6 +37,7 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
     let git_dir = repo.git_dir();
     let seen = SeenStore::load(git_dir.clone());
     let hashes = hash_cache(&files);
+    let covered = covered_map(&deck, &files, &hashes, &repo);
     // Pick up where the reader left off last time.
     let resumed = deck_key
         .as_deref()
@@ -68,6 +69,7 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
         git_dir,
         deck_key,
         hashes,
+        covered,
     };
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
@@ -170,6 +172,39 @@ struct App {
     /// Per-file (hunk hash, changed count), computed once — hashing the
     /// whole diff on every draw is what made the sidebar feel slow.
     hashes: HashMap<String, Vec<(String, usize)>>,
+    /// Per file, the changed lines some slide's excerpt shows — "what the
+    /// deck explains", as opposed to the rest of the diff.
+    covered: HashMap<String, std::collections::HashSet<(String, usize)>>,
+}
+
+/// Which changed lines the deck's excerpts actually display, per file.
+fn covered_map(
+    deck: &Deck,
+    files: &[FileDiff],
+    hashes: &HashMap<String, Vec<(String, usize)>>,
+    repo: &Repo,
+) -> HashMap<String, std::collections::HashSet<(String, usize)>> {
+    let mut covered: HashMap<String, std::collections::HashSet<(String, usize)>> =
+        HashMap::new();
+    let mut cache: HashMap<String, Option<Vec<String>>> = HashMap::new();
+    for step in &deck.steps {
+        let Some(at) = step.anchor() else { continue };
+        let lines = cache
+            .entry(at.file.clone())
+            .or_insert_with(|| repo.read_file(&at.file).ok());
+        let (start, end) = at.range();
+        let rows = excerpt(file_diff(files, &at.file), lines.as_deref(), start, end);
+        let pairs = hashes.get(&at.file);
+        let set = covered.entry(at.file.clone()).or_default();
+        for row in rows {
+            if let (Some(h), Some(i)) = (row.hunk_idx, row.changed_idx)
+                && let Some((hash, _)) = pairs.and_then(|p| p.get(h))
+            {
+                set.insert((hash.clone(), i));
+            }
+        }
+    }
+    covered
 }
 
 fn hash_cache(files: &[FileDiff]) -> HashMap<String, Vec<(String, usize)>> {
@@ -553,7 +588,9 @@ impl App {
                 let area = frame.area();
                 let [content, status] =
                     Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
-                let sidebar_w = if self.files_view && content.width >= 100 {
+                let sidebar_w = if self.files_view && content.width >= 130 {
+                    42
+                } else if self.files_view && content.width >= 100 {
                     34
                 } else {
                     0
@@ -893,6 +930,7 @@ impl App {
 
         // A file row: shortened path, +/- counts, seen progress.
         let hashes = &self.hashes;
+        let covered = &self.covered;
         let file_row = |path: &str,
                         indent: &str,
                         is_current: bool,
@@ -906,24 +944,53 @@ impl App {
                 .get(path)
                 .map(|pairs| seen.progress_cached(path, pairs))
                 .unwrap_or((0, 0));
-            // What matters for the reader is the remainder, not the ratio:
-            // "9/284" reads as progress and hides the 275 still to look at.
-            let seen_text = if t == 0 {
-                String::new()
-            } else if s == t {
-                " ✓".to_string()
-            } else if s > 0 {
-                format!(" {} left", t - s)
-            } else {
-                String::new()
-            };
+            // Three facts per file: what the deck explains (and whether
+            // that part is seen), the file's whole change, and how much
+            // unexplained change is still unseen.
+            let mut suffix: Vec<Span<'static>> = Vec::new();
+            if t > 0 {
+                if s == t {
+                    suffix.push(Span::styled(" ✓".to_string(), Style::new().green()));
+                } else {
+                    let cov = covered.get(path);
+                    let cov_tot = cov.map(|c| c.len()).unwrap_or(0);
+                    let cov_seen = cov
+                        .map(|c| {
+                            c.iter()
+                                .filter(|(h, i)| seen.is_seen(path, h, *i))
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    let unexplained_unseen = (t - s).saturating_sub(cov_tot - cov_seen);
+                    if cov_tot > 0 {
+                        if cov_seen == cov_tot {
+                            suffix.push(Span::styled(
+                                format!(" ◆{cov_tot}✓"),
+                                Style::new().green(),
+                            ));
+                        } else {
+                            suffix.push(Span::styled(
+                                format!(" ◆{cov_seen}/{cov_tot}"),
+                                Style::new().fg(ACCENT),
+                            ));
+                        }
+                    }
+                    if unexplained_unseen > 0 {
+                        suffix.push(Span::styled(
+                            format!(" {unexplained_unseen}"),
+                            Style::new().yellow(),
+                        ));
+                    }
+                }
+            }
             let count_text = match counts {
                 Some((a, d)) if d > 0 => format!(" +{a} -{d}"),
                 Some((a, _)) => format!(" +{a}"),
                 None => String::new(),
             };
+            let suffix_w: usize = suffix.iter().map(|s| display_width(&s.content)).sum();
             let name_w = inner_w
-                .saturating_sub(count_text.len() + seen_text.len() + indent.len() + 1);
+                .saturating_sub(count_text.len() + suffix_w + indent.len() + 1);
             let marker = if is_current { "▎" } else { " " };
             let dim_if = |s: Style| if dim_row { s.add_modifier(Modifier::DIM) } else { s };
             let mut spans = vec![
@@ -943,14 +1010,7 @@ impl App {
                     spans.push(Span::styled(format!(" -{d}"), Style::new().red().dim()));
                 }
             }
-            if !seen_text.is_empty() {
-                let style = if seen_text == " ✓" {
-                    Style::new().green()
-                } else {
-                    Style::new().yellow()
-                };
-                spans.push(Span::styled(seen_text, style));
-            }
+            spans.extend(suffix);
             Line::from(spans)
         };
 
@@ -2101,6 +2161,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("h", "hide fully seen files"),
         ("tab", "focus the sidebar (j/k · enter · v)"),
         ("enter", "dive into the full diff"),
+        ("file list", ""),
+        ("◆ 5/9", "deck-explained lines: seen / shown"),
+        ("yellow n", "unexplained lines still unseen"),
+        ("✓", "whole file seen"),
         ("dive", ""),
         ("n / p", "move the cursor"),
         ("v / V", "mark line / hunk seen"),
@@ -2182,6 +2246,14 @@ diff --git a/src/lib.rs b/src/lib.rs
         };
         let coverage = Coverage::compute(&deck, &files);
         let outline = outline_of(&deck);
+        let covered = covered_map(
+            &deck,
+            &files,
+            &hashes,
+            &Repo {
+                root: PathBuf::from("/nonexistent"),
+            },
+        );
         App {
             deck,
             outline,
@@ -2210,6 +2282,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             git_dir: None,
             deck_key: None,
             hashes,
+            covered,
         }
     }
 
@@ -2641,10 +2714,11 @@ diff --git a/f.rs b/f.rs
         // The cursor advanced past the toggled line.
         let Mode::Dive { cursor: after, .. } = app.mode else { panic!() };
         assert!(after > cursor);
-        // Back on the slides, the sidebar states the remainder, not a ratio.
+        // Back on the slides, the sidebar splits the file into deck-explained
+        // (with its own progress) and unexplained-unseen parts.
         app.mode = Mode::Steps;
         let s = screen(&mut app);
-        assert!(s.contains("1 left"), "remainder missing:\n{s}");
+        assert!(s.contains("◆1/2"), "deck-explained progress missing:\n{s}");
 
         // V on a row of the same hunk marks the rest, toggling to full.
         app.mode = Mode::Dive { scroll: 0, cursor };

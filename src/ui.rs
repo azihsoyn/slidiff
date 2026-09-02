@@ -264,9 +264,9 @@ fn hash_cache(files: &[FileDiff]) -> HashMap<String, Vec<(String, usize)>> {
         .map(|fd| {
             (
                 fd.new_path.clone(),
-                fd.hunks
-                    .iter()
-                    .map(|h| (hunk_hash(h), changed_count(h)))
+                crate::seen::hunk_keys(fd)
+                    .into_iter()
+                    .zip(fd.hunks.iter().map(changed_count))
                     .collect(),
             )
         })
@@ -578,6 +578,17 @@ impl App {
                         && let Some(fd) = file_diff(&self.files, &path).cloned()
                     {
                         self.seen.toggle_file(&fd);
+                        // A whole-file toggle is loud about itself — this
+                        // is the easiest mark to fire by accident.
+                        let (s, t) = self
+                            .seen
+                            .progress_cached(&path, self.hashes_of(&path));
+                        let base = path.rsplit('/').next().unwrap_or(&path);
+                        self.toast = Some(if s == t {
+                            format!("file marked seen: {base}")
+                        } else {
+                            format!("file marks cleared: {base}")
+                        });
                         // Marking flows downward — unless hide-seen will
                         // drop this row, in which case the vanishing row
                         // is the advance and the cursor stays put.
@@ -1009,6 +1020,9 @@ impl App {
         let pos = Position { x, y };
         if let Some(&(_, step)) = self.strip_boxes.iter().find(|(rect, _)| rect.contains(pos)) {
             self.step = step;
+            // Jumping to a slide is reading slides — take the focus with
+            // you, or a later `v` silently toggles a whole file.
+            self.focus = Focus::Slides;
             return;
         }
         let hit = self
@@ -1019,15 +1033,22 @@ impl App {
         match hit {
             Some(SideTarget::Step(step)) => {
                 self.step = step;
+                self.focus = Focus::Slides;
             }
             Some(SideTarget::File(file)) => {
                 self.dive_file = Some(file);
+                self.focus = Focus::Slides;
                 self.mode = Mode::Dive {
                     scroll: 0,
                     cursor: 0,
                 };
             }
-            None => {}
+            None => {
+                // A click on the slide itself pulls focus back too.
+                if !self.sidebar_area.contains(pos) {
+                    self.focus = Focus::Slides;
+                }
+            }
         }
     }
 
@@ -3361,6 +3382,112 @@ diff --git a/f.rs b/f.rs
             diff_fingerprint(&a, &hashes_a),
             diff_fingerprint(&b, &hashes_b)
         );
+    }
+
+    #[test]
+    fn slide_v_never_touches_hunks_outside_the_range() {
+        let two_hunks = "\
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,3 +5,3 @@
+ aaa
+-early old
++early new
+ bbb
+@@ -20,3 +20,3 @@
+ ccc
+-late old
++late new
+ ddd
+";
+        let files = parse_unified(two_hunks);
+        let hashes = hash_cache(&files);
+        let deck = Deck {
+            title: "t".into(),
+            base: None,
+            steps: vec![Step::Point {
+                at: "src/lib.rs:20-22".parse().unwrap(),
+                claim: "c".into(),
+                notes: vec![],
+                speaker_notes: None,
+            }],
+        };
+        let coverage = Coverage::compute(&deck, &files);
+        let outline = outline_of(&deck);
+        let covered = covered_map(
+            &deck,
+            &files,
+            &hashes,
+            &Repo {
+                root: PathBuf::from("/nonexistent"),
+            },
+        );
+        let mut app = App {
+            deck,
+            outline,
+            files_view: true,
+            hide_seen: false,
+            sidebar_hits: Vec::new(),
+            repo: Repo {
+                root: PathBuf::from("/nonexistent"),
+            },
+            files,
+            coverage,
+            step: 0,
+            mode: Mode::Steps,
+            notes_view: NotesView::Panel,
+            file_cache: HashMap::new(),
+            seen: SeenStore::in_memory(),
+            comments: CommentStore::load(None),
+            input: None,
+            help: false,
+            dive_file: None,
+            sidebar_area: Rect::default(),
+            focus: Focus::Slides,
+            toast: None,
+            sidebar_cursor: 0,
+            sidebar_items: Vec::new(),
+            strip_boxes: Vec::new(),
+            git_dir: None,
+            deck_key: None,
+            watch_at: std::time::Instant::now(),
+            fingerprint: 0,
+            deck_mtime: None,
+            hashes,
+            covered,
+        };
+        app.slide_toggle_seen();
+        let keys = crate::seen::hunk_keys(&app.files[0]);
+        // The late hunk's two changed lines are marked...
+        assert!(app.seen.is_seen("src/lib.rs", &keys[1], 0));
+        assert!(app.seen.is_seen("src/lib.rs", &keys[1], 1));
+        // ...and the early hunk is untouched.
+        assert!(!app.seen.is_seen("src/lib.rs", &keys[0], 0));
+        assert!(!app.seen.is_seen("src/lib.rs", &keys[0], 1));
+    }
+
+    #[test]
+    fn clicking_the_filmstrip_returns_focus_to_the_slides() {
+        let mut app = app_with(vec![
+            Step::Cover {
+                what: "w".into(),
+                bullets: vec![],
+                level: 1,
+                speaker_notes: None,
+            },
+            Step::Point {
+                at: "src/lib.rs:11".parse().unwrap(),
+                claim: "c".into(),
+                notes: vec![],
+                speaker_notes: None,
+            },
+        ]);
+        screen(&mut app);
+        app.focus = Focus::Sidebar;
+        let (rect, _) = app.strip_boxes[1];
+        app.on_click(rect.x + 1, rect.y + 1);
+        assert_eq!(app.focus, Focus::Slides, "click must take focus back");
     }
 
     #[test]

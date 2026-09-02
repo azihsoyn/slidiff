@@ -58,13 +58,9 @@ impl SeenStore {
     pub fn toggle_file(&mut self, fd: &FileDiff) {
         let (seen, total) = self.progress_for(fd);
         let make_seen = !(total > 0 && seen == total);
-        for hunk in &fd.hunks {
-            self.0.set_hunk(
-                &fd.new_path,
-                &hunk_hash(hunk),
-                changed_count(hunk),
-                make_seen,
-            );
+        for (key, hunk) in hunk_keys(fd).iter().zip(&fd.hunks) {
+            self.0
+                .set_hunk(&fd.new_path, key, changed_count(hunk), make_seen);
         }
     }
 
@@ -91,14 +87,12 @@ impl SeenStore {
     /// (seen, total) changed lines for one file, counting only marks whose
     /// hunk hash still exists in the current diff.
     pub fn progress_for(&self, fd: &FileDiff) -> (usize, usize) {
-        let hunks: Vec<(String, usize)> = fd
-            .hunks
-            .iter()
-            .map(|h| (hunk_hash(h), changed_count(h)))
-            .collect();
+        let keys = hunk_keys(fd);
         self.0.progress(
             &fd.new_path,
-            hunks.iter().map(|(h, c)| (h.as_str(), *c)),
+            keys.iter()
+                .map(String::as_str)
+                .zip(fd.hunks.iter().map(changed_count)),
         )
     }
 }
@@ -108,6 +102,28 @@ pub fn changed_count(hunk: &Hunk) -> usize {
         .iter()
         .filter(|l| l.kind != LineKind::Context)
         .count()
+}
+
+/// Content keys for a file's hunks. Identical hunks in one file would
+/// alias — marking one would mark them all — so the nth duplicate gets a
+/// `#n` suffix. Unique hunks (the normal case) keep the bare hash, which
+/// also keeps existing marks valid.
+pub fn hunk_keys(fd: &FileDiff) -> Vec<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    fd.hunks
+        .iter()
+        .map(|h| {
+            let raw = hunk_hash(h);
+            let n = counts.entry(raw.clone()).or_insert(0);
+            let key = if *n == 0 {
+                raw.clone()
+            } else {
+                format!("{raw}#{n}")
+            };
+            *n += 1;
+            key
+        })
+        .collect()
 }
 
 pub fn hunk_hash(hunk: &Hunk) -> String {
@@ -169,6 +185,34 @@ diff --git a/f.rs b/f.rs
         store.toggle_line("f.rs", &hunk_hash(&fd.hunks[0]), 0);
         store.toggle_file(fd);
         assert_eq!(store.progress_for(fd), (3, 3));
+    }
+
+    #[test]
+    fn identical_hunks_get_distinct_keys() {
+        let two = "\
+diff --git a/f.rs b/f.rs
+--- a/f.rs
++++ b/f.rs
+@@ -1,2 +1,3 @@
+ ctx
++same line
+ tail
+@@ -10,2 +11,3 @@
+ ctx
++same line
+ tail
+";
+        let files = parse_unified(two);
+        let keys = hunk_keys(&files[0]);
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1], "duplicate hunks must not alias");
+        assert!(keys[1].ends_with("#1"), "{keys:?}");
+
+        // Marking one leaves the twin untouched.
+        let mut store = SeenStore::in_memory();
+        store.toggle_line("f.rs", &keys[0], 0);
+        assert!(store.is_seen("f.rs", &keys[0], 0));
+        assert!(!store.is_seen("f.rs", &keys[1], 0));
     }
 
     #[test]

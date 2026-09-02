@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use crate::diff::{FileDiff, LineKind};
-use crate::seen::hunk_hash;
+use crate::seen::hunk_keys;
 
 pub struct CommentStore(diffseen::Comments);
 
@@ -85,7 +85,8 @@ fn resolve<'a>(
     idx: usize,
 ) -> Option<(u32, &'a str, LineKind)> {
     let fd = files.iter().find(|f| f.new_path == file)?;
-    let hunk = fd.hunks.iter().find(|h| hunk_hash(h) == hash)?;
+    let hunk_idx = hunk_keys(fd).iter().position(|k| k == hash)?;
+    let hunk = fd.hunks.get(hunk_idx)?;
     let line = hunk
         .lines
         .iter()
@@ -99,6 +100,7 @@ fn resolve<'a>(
 mod tests {
     use super::*;
     use crate::diff::parse_unified;
+    use crate::seen::hunk_hash;
 
     const SAMPLE: &str = "\
 diff --git a/f.rs b/f.rs

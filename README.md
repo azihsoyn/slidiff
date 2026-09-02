@@ -47,12 +47,21 @@ the code before answering.
 
 The deck is the guided tour; the dive is the inspection. In the dive, `v`
 marks the changed line under the cursor as seen (and moves on), `V` marks
-the whole hunk. Seen lines lose their tint — only what is still unreviewed
-stays vivid — and the sidebar tracks per-file progress (`3/5`, ✓ when done)
-including the files the deck never points at, each of them one click away.
-The record lives in `.git/slidiff/seen.json`: local, never committed, and
-keyed by hunk content, so a hunk that changes under you loses its marks
-automatically.
+the whole hunk, `x` flags a line to come back to (it stays vivid), and `c`
+attaches a comment to it. Seen lines lose their tint — only what is still
+unreviewed stays vivid — and the sidebar tracks per-file progress
+(`deck 5/9`, `rest 374`, `⚑2`, ✓ when done) including the files the deck
+never points at. `h` hides what needs no more attention. The records live
+under `.git/slidiff/`: local, never committed, keyed by hunk content, so a
+hunk that changes under you loses its marks automatically.
+
+Comments travel back: `C` resolves every anchor to its current line,
+quotes the line, and sends the bundle the same way as a question;
+`slidiff comments` prints it for an agent without the TUI.
+
+The viewer watches the repository while open: an edited deck or a changed
+diff reloads by itself, and only the hunks that actually changed fall back
+to unreviewed.
 
 ## A deck, in markdown
 

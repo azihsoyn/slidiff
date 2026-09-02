@@ -40,6 +40,10 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
     let comments = CommentStore::load(git_dir.clone());
     let hashes = hash_cache(&files);
     let covered = covered_map(&deck, &files, &hashes, &repo);
+    let fingerprint = diff_fingerprint(&files, &hashes);
+    let deck_mtime = deck_key
+        .as_deref()
+        .and_then(|k| std::fs::metadata(k).and_then(|m| m.modified()).ok());
     // Pick up where the reader left off last time.
     let resumed = deck_key
         .as_deref()
@@ -73,6 +77,9 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
         deck_key,
         hashes,
         covered,
+        watch_at: std::time::Instant::now(),
+        fingerprint,
+        deck_mtime,
     };
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
@@ -187,6 +194,11 @@ struct App {
     git_dir: Option<std::path::PathBuf>,
     /// Identity of the open deck, for the resume record.
     deck_key: Option<String>,
+    /// Watch state: when we last looked, the diff's fingerprint, and the
+    /// deck file's mtime.
+    watch_at: std::time::Instant,
+    fingerprint: u64,
+    deck_mtime: Option<std::time::SystemTime>,
     /// Per-file (hunk hash, changed count), computed once — hashing the
     /// whole diff on every draw is what made the sidebar feel slow.
     hashes: HashMap<String, Vec<(String, usize)>>,
@@ -223,6 +235,27 @@ fn covered_map(
         }
     }
     covered
+}
+
+/// One number for "did the diff change": FNV over every file's path and
+/// hunk hashes, in diff order.
+fn diff_fingerprint(files: &[FileDiff], hashes: &HashMap<String, Vec<(String, usize)>>) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    for fd in files {
+        eat(fd.new_path.as_bytes());
+        if let Some(pairs) = hashes.get(&fd.new_path) {
+            for (hash, _) in pairs {
+                eat(hash.as_bytes());
+            }
+        }
+    }
+    h
 }
 
 fn hash_cache(files: &[FileDiff]) -> HashMap<String, Vec<(String, usize)>> {
@@ -368,7 +401,14 @@ impl App {
                     crate::resume::save(&self.git_dir, key, self.step);
                 }
             }
+            if self.watch_at.elapsed() >= std::time::Duration::from_secs(2) {
+                self.watch_tick();
+            }
             terminal.draw(|frame| self.draw(frame))?;
+            // Wait briefly for input; waking with none lets the watch run.
+            if !event::poll(std::time::Duration::from_millis(300))? {
+                continue;
+            }
             // Handle everything already queued before redrawing once — a
             // wheel burst is many events but should cost one draw.
             loop {
@@ -378,6 +418,47 @@ impl App {
                 if !event::poll(std::time::Duration::ZERO)? {
                     break;
                 }
+            }
+        }
+    }
+
+    /// The deck and the diff both keep moving while an agent works; pick
+    /// up their changes without being asked. Seen marks need no care —
+    /// content-addressed keys already shed changed hunks.
+    fn watch_tick(&mut self) {
+        self.watch_at = std::time::Instant::now();
+        if let Some(key) = self.deck_key.clone() {
+            let mtime = std::fs::metadata(&key).and_then(|m| m.modified()).ok();
+            if mtime != self.deck_mtime {
+                self.deck_mtime = mtime;
+                match crate::load_deck(std::path::Path::new(&key)) {
+                    Ok(deck) if deck.validate().is_empty() => {
+                        self.deck = deck;
+                        self.outline = outline_of(&self.deck);
+                        self.step = self.step.min(self.deck.steps.len().saturating_sub(1));
+                        self.coverage = Coverage::compute(&self.deck, &self.files);
+                        self.covered =
+                            covered_map(&self.deck, &self.files, &self.hashes, &self.repo);
+                        self.toast = Some("deck reloaded".to_string());
+                    }
+                    _ => {
+                        self.toast =
+                            Some("deck changed but does not load — keeping the old one".to_string());
+                    }
+                }
+            }
+        }
+        if let Ok(files) = load_diff(&self.repo, self.deck.base.as_deref()) {
+            let hashes = hash_cache(&files);
+            let fingerprint = diff_fingerprint(&files, &hashes);
+            if fingerprint != self.fingerprint {
+                self.fingerprint = fingerprint;
+                self.files = files;
+                self.hashes = hashes;
+                self.file_cache.clear();
+                self.coverage = Coverage::compute(&self.deck, &self.files);
+                self.covered = covered_map(&self.deck, &self.files, &self.hashes, &self.repo);
+                self.toast = Some("diff reloaded".to_string());
             }
         }
     }
@@ -2417,6 +2498,9 @@ diff --git a/src/lib.rs b/src/lib.rs
             strip_boxes: Vec::new(),
             git_dir: None,
             deck_key: None,
+            watch_at: std::time::Instant::now(),
+            fingerprint: 0,
+            deck_mtime: None,
             hashes,
             covered,
         }
@@ -3143,6 +3227,47 @@ diff --git a/f.rs b/f.rs
         app.hide_seen = true;
         let s = screen(&mut app);
         assert!(s.contains("⚑1"), "flagged file must stay listed:\n{s}");
+    }
+
+    #[test]
+    fn watch_reloads_an_edited_deck_and_keeps_a_broken_one_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let deck_path = dir.path().join("deck.md");
+        std::fs::write(&deck_path, "# t\n\nw\n\n---\n\n## one\n@ src/lib.rs:11\n").unwrap();
+        let mut app = app_with(vec![Step::Cover {
+            what: "w".into(),
+            bullets: vec![],
+            level: 1,
+            speaker_notes: None,
+        }]);
+        app.deck_key = Some(deck_path.to_string_lossy().into_owned());
+        app.watch_tick();
+        assert_eq!(app.deck.steps.len(), 2, "deck should reload from disk");
+        assert_eq!(app.toast.as_deref(), Some("deck reloaded"));
+
+        // A broken edit keeps the old deck and says so.
+        std::fs::write(&deck_path, "# t\n\nw\n\n---\n\n## too long claim ".to_string() + &"x".repeat(90) + "\n@ src/lib.rs:11\n").unwrap();
+        // mtime granularity can swallow rapid writes; force a difference.
+        app.deck_mtime = None;
+        app.watch_tick();
+        assert_eq!(app.deck.steps.len(), 2, "broken deck must not replace the good one");
+        assert!(app.toast.as_deref().unwrap_or("").contains("does not load"));
+    }
+
+    #[test]
+    fn diff_fingerprint_tracks_content() {
+        let a = parse_unified(SAMPLE);
+        let hashes_a = hash_cache(&a);
+        let b = parse_unified(&SAMPLE.replace("take", "grab"));
+        let hashes_b = hash_cache(&b);
+        assert_eq!(
+            diff_fingerprint(&a, &hashes_a),
+            diff_fingerprint(&a, &hashes_a)
+        );
+        assert_ne!(
+            diff_fingerprint(&a, &hashes_a),
+            diff_fingerprint(&b, &hashes_b)
+        );
     }
 
     #[test]

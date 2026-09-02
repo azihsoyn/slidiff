@@ -50,17 +50,7 @@ fn cmd_schema() -> Result<ExitCode> {
 }
 
 fn load_deck(path: &Path) -> Result<Deck> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
-    let deck: Deck = match path.extension().and_then(|e| e.to_str()) {
-        Some("json") => serde_json::from_str(&text)
-            .with_context(|| format!("{} is not a valid deck", path.display()))?,
-        Some("md" | "markdown") => slidiff::mdeck::parse(&text)
-            .map_err(|errors| anyhow::anyhow!("{}", errors.join("\n")))?,
-        _ => serde_yaml::from_str(&text)
-            .with_context(|| format!("{} is not a valid deck", path.display()))?,
-    };
-    Ok(deck)
+    slidiff::load_deck(path)
 }
 
 fn cmd_check(path: &Path) -> Result<ExitCode> {

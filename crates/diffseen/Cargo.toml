@@ -2,7 +2,11 @@
 name = "diffseen"
 version = "0.1.0"
 edition = "2024"
-description = "Content-addressed, local record of which changed lines of a diff a human has reviewed"
+description = "Content-addressed, local record of which changed lines of a diff a human has reviewed — seen marks, flags, and anchored comments that invalidate when the hunk changes"
+license = "MIT"
+repository = "https://github.com/azihsoyn/slidiff"
+keywords = ["diff", "review", "code-review"]
+categories = ["development-tools"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -5,9 +5,16 @@ members = [".", "crates/diffseen"]
 name = "slidiff"
 version = "0.1.0"
 edition = "2024"
+description = "A slide deck an agent writes and a person reads in the terminal — slides point at file:line, the viewer draws the real diff, and review progress travels back"
+license = "MIT"
+repository = "https://github.com/azihsoyn/slidiff"
+readme = "README.md"
+keywords = ["diff", "review", "tui", "slides", "agent"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["examples/", "schema/"]
 
 [dependencies]
-diffseen = { path = "crates/diffseen" }
+diffseen = { path = "crates/diffseen", version = "0.1.0" }
 anyhow = "1.0.104"
 crossterm = "0.29.0"
 ratatui = "0.30.2"

@@ -1328,32 +1328,50 @@ impl App {
     }
 
     fn draw_cover(&self, frame: &mut Frame, area: Rect, what: &str, bullets: &[String]) {
+        let width = 76.min(area.width.saturating_sub(2));
+        let wrap_w = usize::from(width);
+        // Headlines center; the bullet list is a left-aligned block —
+        // centered inside the slide as a whole, but reading as a list,
+        // with wrapped lines hanging under their text.
+        let mut lines: Vec<Line> = Vec::new();
         // The first slide carries the deck title; later cover-shaped
         // slides are section headlines and stand on their own.
-        let mut lines = if self.step == 0 {
-            vec![
-                Line::from(self.deck.title.clone().bold().fg(ACCENT)),
-                Line::default(),
-                Line::from(what.to_string().bold()),
-            ]
+        if self.step == 0 {
+            for seg in wrap_display(&self.deck.title, wrap_w) {
+                lines.push(Line::from(seg.bold().fg(ACCENT)).centered());
+            }
+            lines.push(Line::default());
+            for seg in wrap_display(what, wrap_w) {
+                lines.push(Line::from(seg.bold()).centered());
+            }
         } else {
-            vec![Line::from(what.to_string().bold().fg(ACCENT))]
-        };
+            for seg in wrap_display(what, wrap_w) {
+                lines.push(Line::from(seg.bold().fg(ACCENT)).centered());
+            }
+        }
         if !bullets.is_empty() {
             lines.push(Line::default());
+            let inner = wrap_w.saturating_sub(2).max(8);
+            let block_w = bullets
+                .iter()
+                .map(|b| display_width(b).min(inner) + 2)
+                .max()
+                .unwrap_or(2);
+            let pad = " ".repeat(wrap_w.saturating_sub(block_w) / 2);
             for b in bullets {
-                lines.push(Line::from(vec![
-                    Span::styled("• ", Style::new().fg(ACCENT)),
-                    Span::raw(b.clone()),
-                ]));
+                for (i, seg) in wrap_display(b, inner).into_iter().enumerate() {
+                    let marker = if i == 0 { "• " } else { "  " };
+                    lines.push(Line::from(vec![
+                        Span::raw(pad.clone()),
+                        Span::styled(marker, Style::new().fg(ACCENT)),
+                        Span::raw(seg),
+                    ]));
+                }
             }
         }
         let height = (lines.len() as u16 + 2).min(area.height);
-        let block = centered(area, 76.min(area.width.saturating_sub(2)), height);
-        frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }).centered(),
-            block,
-        );
+        let block = centered(area, width, height);
+        frame.render_widget(Paragraph::new(lines), block);
     }
 
     /// point and risk: claim with an accent bar, then the excerpt with
@@ -2158,6 +2176,46 @@ fn fit(s: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
+/// Greedy display-width wrapping, breaking at the last space when one is
+/// in reach (CJK text has none and breaks mid-run, which is correct).
+fn wrap_display(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(4);
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    let mut last_space: Option<usize> = None; // byte index into cur
+    for c in s.chars() {
+        let cw = if (c as u32) > 0x1100 { 2 } else { 1 };
+        if cur_w + cw > width {
+            // A line break exactly where a space overflows IS the break.
+            if c == ' ' {
+                out.push(std::mem::take(&mut cur).trim_end().to_string());
+                cur_w = 0;
+                last_space = None;
+                continue;
+            }
+            if let Some(cut) = last_space {
+                let rest = cur.split_off(cut + 1);
+                out.push(cur.trim_end().to_string());
+                cur = rest;
+            } else {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur_w = display_width(&cur);
+            last_space = None;
+        }
+        if c == ' ' {
+            last_space = Some(cur.len());
+        }
+        cur.push(c);
+        cur_w += cw;
+    }
+    if !cur.trim().is_empty() || out.is_empty() {
+        out.push(cur.trim_end().to_string());
+    }
+    out
+}
+
 /// Rough display width: wide for CJK, 1 otherwise. Good enough for layout.
 fn display_width(s: &str) -> usize {
     s.chars()
@@ -2578,6 +2636,41 @@ diff --git a/f.rs b/f.rs
         assert!(
             spans.iter().all(|sp| !sp.style.add_modifier.contains(Modifier::UNDERLINED)),
             "no underline anywhere: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn wrap_display_breaks_at_spaces_and_by_width() {
+        assert_eq!(wrap_display("short", 20), vec!["short"]);
+        assert_eq!(
+            wrap_display("aaa bbb ccc", 7),
+            vec!["aaa bbb", "ccc"]
+        );
+        // CJK: width 2 per char, no spaces — breaks mid-run.
+        assert_eq!(wrap_display("ああああ", 4), vec!["ああ", "ああ"]);
+    }
+
+    #[test]
+    fn cover_bullets_hang_left_aligned_when_wrapped() {
+        let mut app = app_with(vec![Step::Cover {
+            what: "w".into(),
+            bullets: vec!["あ".repeat(50)],
+            level: 1,
+            speaker_notes: None,
+        }]);
+        let s = screen(&mut app);
+        let rows: Vec<&str> = s.lines().collect();
+        let first = rows
+            .iter()
+            .position(|l| l.contains("• あ"))
+            .expect("bullet row");
+        let col = rows[first].find("• ").unwrap();
+        // The wrapped continuation starts under the bullet text, not
+        // re-centered: same column, marker replaced by spaces.
+        let cont = rows[first + 1];
+        assert!(
+            cont.get(col..).is_some_and(|t| t.starts_with("  あ")),
+            "continuation misaligned:\n{s}"
         );
     }
 

@@ -36,6 +36,22 @@ impl SeenStore {
         self.0.toggle_hunk(file, hunk_hash, changed_total);
     }
 
+    pub fn is_flagged(&self, file: &str, hunk_hash: &str, idx: usize) -> bool {
+        self.0.is_flagged(file, hunk_hash, idx)
+    }
+
+    pub fn toggle_flag(&mut self, file: &str, hunk_hash: &str, idx: usize) {
+        self.0.toggle_flag(file, hunk_hash, idx);
+    }
+
+    pub fn set_flag(&mut self, file: &str, hunk_hash: &str, idx: usize) {
+        self.0.set_flag(file, hunk_hash, idx);
+    }
+
+    pub fn flag_count_cached(&self, file: &str, hunks: &[(String, usize)]) -> usize {
+        self.0.flag_count(file, hunks)
+    }
+
     /// Mark every hunk of the file seen; if the file already is fully
     /// seen, clear it. One keystroke for twenty near-identical jsonnet
     /// changes.

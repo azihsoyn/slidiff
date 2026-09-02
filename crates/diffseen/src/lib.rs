@@ -32,24 +32,29 @@ type SeenMap = BTreeMap<String, BTreeMap<String, BTreeSet<usize>>>;
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct SeenFile {
     seen: SeenMap,
+    /// Lines the reader looked at and wants to come back to. A flag
+    /// implies seen — you cannot worry about a line you have not read.
+    #[serde(default)]
+    flagged: SeenMap,
 }
 
 pub struct Store {
     path: Option<PathBuf>,
     map: SeenMap,
+    flagged: SeenMap,
 }
 
 impl Store {
     /// Open (or create on first save) the store at `path`.
     pub fn open(path: PathBuf) -> Store {
-        let map = std::fs::read_to_string(&path)
+        let file = std::fs::read_to_string(&path)
             .ok()
             .and_then(|text| serde_json::from_str::<SeenFile>(&text).ok())
-            .map(|f| f.seen)
             .unwrap_or_default();
         Store {
             path: Some(path),
-            map,
+            map: file.seen,
+            flagged: file.flagged,
         }
     }
 
@@ -58,6 +63,7 @@ impl Store {
         Store {
             path: None,
             map: SeenMap::new(),
+            flagged: SeenMap::new(),
         }
     }
 
@@ -68,9 +74,60 @@ impl Store {
         }
         if let Ok(text) = serde_json::to_string_pretty(&SeenFile {
             seen: self.map.clone(),
+            flagged: self.flagged.clone(),
         }) {
             let _ = std::fs::write(path, text);
         }
+    }
+
+    pub fn is_flagged(&self, file: &str, hunk_hash: &str, idx: usize) -> bool {
+        self.flagged
+            .get(file)
+            .and_then(|h| h.get(hunk_hash))
+            .is_some_and(|s| s.contains(&idx))
+    }
+
+    /// Toggle the come-back-to-this flag. Raising it also marks the line
+    /// seen; lowering it leaves seen alone.
+    pub fn toggle_flag(&mut self, file: &str, hunk_hash: &str, idx: usize) {
+        let set = self
+            .flagged
+            .entry(file.to_string())
+            .or_default()
+            .entry(hunk_hash.to_string())
+            .or_default();
+        if set.insert(idx) {
+            self.entry(file, hunk_hash).insert(idx);
+        } else {
+            set.remove(&idx);
+        }
+        self.save();
+    }
+
+    /// Force the flag on (used when a comment lands on the line).
+    pub fn set_flag(&mut self, file: &str, hunk_hash: &str, idx: usize) {
+        self.flagged
+            .entry(file.to_string())
+            .or_default()
+            .entry(hunk_hash.to_string())
+            .or_default()
+            .insert(idx);
+        self.entry(file, hunk_hash).insert(idx);
+        self.save();
+    }
+
+    /// Flags still alive in the current diff for one file.
+    pub fn flag_count(&self, file: &str, hunks: &[(String, usize)]) -> usize {
+        hunks
+            .iter()
+            .map(|(hash, changed)| {
+                self.flagged
+                    .get(file)
+                    .and_then(|h| h.get(hash.as_str()))
+                    .map(|s| s.iter().filter(|&&i| i < *changed).count())
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 
     pub fn is_seen(&self, file: &str, hunk_hash: &str, idx: usize) -> bool {
@@ -151,6 +208,93 @@ impl Store {
     }
 }
 
+/// Review comments, anchored the same content-addressed way as seen
+/// marks: file → hunk hash → changed-line index → texts. A hunk that
+/// changes orphans its comments for display, but the texts stay in the
+/// file — a review note is not something to lose silently.
+type CommentMap = BTreeMap<String, BTreeMap<String, BTreeMap<usize, Vec<String>>>>;
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct CommentsFile {
+    comments: CommentMap,
+}
+
+pub struct Comments {
+    path: Option<PathBuf>,
+    map: CommentMap,
+}
+
+impl Comments {
+    pub fn open(path: PathBuf) -> Comments {
+        let map = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<CommentsFile>(&text).ok())
+            .map(|f| f.comments)
+            .unwrap_or_default();
+        Comments {
+            path: Some(path),
+            map,
+        }
+    }
+
+    pub fn in_memory() -> Comments {
+        Comments {
+            path: None,
+            map: CommentMap::new(),
+        }
+    }
+
+    pub fn add(&mut self, file: &str, hunk_hash: &str, idx: usize, text: String) {
+        self.map
+            .entry(file.to_string())
+            .or_default()
+            .entry(hunk_hash.to_string())
+            .or_default()
+            .entry(idx)
+            .or_default()
+            .push(text);
+        self.save();
+    }
+
+    pub fn get(&self, file: &str, hunk_hash: &str, idx: usize) -> &[String] {
+        self.map
+            .get(file)
+            .and_then(|h| h.get(hunk_hash))
+            .and_then(|l| l.get(&idx))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.values().flat_map(|h| h.values()).all(|l| l.is_empty())
+    }
+
+    /// Every comment: (file, hunk hash, changed-line index, text).
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, usize, &str)> {
+        self.map.iter().flat_map(|(file, hunks)| {
+            hunks.iter().flat_map(move |(hash, lines)| {
+                lines.iter().flat_map(move |(idx, texts)| {
+                    texts
+                        .iter()
+                        .map(move |t| (file.as_str(), hash.as_str(), *idx, t.as_str()))
+                })
+            })
+        })
+    }
+
+    fn save(&self) {
+        let Some(path) = &self.path else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&CommentsFile {
+            comments: self.map.clone(),
+        }) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+}
+
 /// Deterministic content hash (FNV-1a, 64 bit) over a hunk's lines.
 /// Positions are excluded on purpose: a hunk that merely moved keeps its
 /// marks, a hunk that changed loses them.
@@ -228,6 +372,46 @@ mod tests {
         let h = sample_hash();
         store.toggle_line("f", &h, 99);
         assert_eq!(store.seen_count("f", &h, 3), 0);
+    }
+
+    #[test]
+    fn flags_imply_seen_and_survive_round_trips() {
+        let h = sample_hash();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seen.json");
+        {
+            let mut store = Store::open(path.clone());
+            store.toggle_flag("f", &h, 1);
+            assert!(store.is_flagged("f", &h, 1));
+            assert!(store.is_seen("f", &h, 1), "flag implies seen");
+            assert_eq!(store.flag_count("f", &[(h.clone(), 3)]), 1);
+        }
+        let mut store = Store::open(path);
+        assert!(store.is_flagged("f", &h, 1));
+        store.toggle_flag("f", &h, 1);
+        assert!(!store.is_flagged("f", &h, 1));
+        assert!(store.is_seen("f", &h, 1), "lowering a flag keeps seen");
+        // Stale flags beyond the current hunk do not count.
+        store.set_flag("f", &h, 99);
+        assert_eq!(store.flag_count("f", &[(h.clone(), 3)]), 0);
+    }
+
+    #[test]
+    fn comments_accumulate_per_line_and_iterate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comments.json");
+        let h = sample_hash();
+        {
+            let mut c = Comments::open(path.clone());
+            assert!(c.is_empty());
+            c.add("f", &h, 0, "first".into());
+            c.add("f", &h, 0, "second".into());
+            c.add("g", "otherhash", 2, "third".into());
+        }
+        let c = Comments::open(path);
+        assert_eq!(c.get("f", &h, 0), &["first", "second"]);
+        assert_eq!(c.iter().count(), 3);
+        assert!(!c.is_empty());
     }
 
     #[test]

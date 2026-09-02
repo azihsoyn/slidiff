@@ -1,3 +1,4 @@
+pub mod comments;
 pub mod deck;
 pub mod diff;
 pub mod highlight;

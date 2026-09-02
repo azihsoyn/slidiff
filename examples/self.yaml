@@ -1,7 +1,7 @@
 # The deck this branch would hand you about itself. View from the repo root:
 #   cargo run -- examples/self.yaml
 title: "slidiff v0.2: 切り出しと注釈をスキーマで強制する"
-base: master
+base: main
 steps:
   - type: cover
     what: "agent が書き、人が端末で読む報告 deck。1 画面 1 主張"

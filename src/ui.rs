@@ -28,6 +28,7 @@ use crate::diff::{
     ExcerptRow, FileDiff, LineKind, Repo, Segment, emphasize_hunk, excerpt, file_diff, load_diff,
 };
 use crate::highlight::{Lang, highlight};
+use crate::comments::CommentStore;
 use crate::seen::{SeenStore, changed_count, hunk_hash};
 
 pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
@@ -36,6 +37,7 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
     let outline = outline_of(&deck);
     let git_dir = repo.git_dir();
     let seen = SeenStore::load(git_dir.clone());
+    let comments = CommentStore::load(git_dir.clone());
     let hashes = hash_cache(&files);
     let covered = covered_map(&deck, &files, &hashes, &repo);
     // Pick up where the reader left off last time.
@@ -59,7 +61,8 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
         dive_file: None,
         sidebar_area: Rect::default(),
         focus: Focus::Slides,
-        ask: None,
+        input: None,
+        comments,
         help: false,
         toast: resumed.map(|s| format!("resumed at slide {}", s + 1)),
         sidebar_cursor: 0,
@@ -91,6 +94,19 @@ enum SideTarget {
     Step(usize),
     /// Open the dive on a file the deck does not point at.
     File(String),
+}
+
+/// A floating one-line text input and what it is for.
+struct InputBox {
+    kind: InputKind,
+    buf: String,
+}
+
+enum InputKind {
+    /// Question about the current slide, sent with its context.
+    Ask,
+    /// Review comment anchored to a changed line.
+    Comment { file: String, hash: String, idx: usize },
 }
 
 /// Where key input goes on the steps screen.
@@ -146,14 +162,16 @@ struct App {
     file_cache: HashMap<String, Option<Vec<String>>>,
     /// Which changed lines the reader has marked seen. Local, persisted.
     seen: SeenStore,
+    /// Anchored review comments, bundled back to the agent with C.
+    comments: CommentStore,
     /// When set, the dive shows this file instead of the current step's.
     dive_file: Option<String>,
     /// Where the sidebar was last drawn, for wheel routing.
     sidebar_area: Rect,
     /// Keyboard focus on the steps screen; Tab switches.
     focus: Focus,
-    /// Open question input (`a`): the buffer being typed.
-    ask: Option<String>,
+    /// Open text input (`a` question / `c` comment): what and the buffer.
+    input: Option<InputBox>,
     /// Keyboard shortcut overlay (`?`); any key closes it.
     help: bool,
     /// One-shot status message (e.g. "copied"), cleared on the next key.
@@ -404,20 +422,31 @@ impl App {
         if ctrl_c {
             return Ok(true);
         }
-        // The question input swallows every key while open — `q` is a
-        // letter here, not quit.
-        if let Some(buf) = &mut self.ask {
+        // An open text input swallows every key — `q` is a letter here,
+        // not quit.
+        if let Some(input) = &mut self.input {
             match key.code {
-                KeyCode::Esc => self.ask = None,
+                KeyCode::Esc => self.input = None,
                 KeyCode::Enter => {
-                    let question = self.ask.take().unwrap_or_default();
-                    let prompt = self.build_ask_prompt(&question);
-                    self.toast = Some(deliver_ask(&prompt));
+                    let InputBox { kind, buf } = self.input.take().unwrap();
+                    match kind {
+                        InputKind::Ask => {
+                            let prompt = self.build_ask_prompt(&buf);
+                            self.toast = Some(deliver_ask(&prompt));
+                        }
+                        InputKind::Comment { file, hash, idx } => {
+                            if !buf.trim().is_empty() {
+                                self.comments.add(&file, &hash, idx, buf.trim().to_string());
+                                self.seen.set_flag(&file, &hash, idx);
+                                self.toast = Some("comment added".to_string());
+                            }
+                        }
+                    }
                 }
                 KeyCode::Backspace => {
-                    buf.pop();
+                    input.buf.pop();
                 }
-                KeyCode::Char(c) => buf.push(c),
+                KeyCode::Char(c) => input.buf.push(c),
                 _ => {}
             }
             return Ok(false);
@@ -508,7 +537,13 @@ impl App {
                 KeyCode::Char('f') => self.files_view = !self.files_view,
                 KeyCode::Char('h') => self.hide_seen = !self.hide_seen,
                 KeyCode::Char('v') => self.slide_toggle_seen(),
-                KeyCode::Char('a') => self.ask = Some(String::new()),
+                KeyCode::Char('a') => {
+                    self.input = Some(InputBox {
+                        kind: InputKind::Ask,
+                        buf: String::new(),
+                    })
+                }
+                KeyCode::Char('C') => self.send_comments(),
                 KeyCode::Tab => {
                     if self.files_view && !self.sidebar_items.is_empty() {
                         self.focus = Focus::Sidebar;
@@ -533,6 +568,9 @@ impl App {
                 }
                 KeyCode::Char('v') => self.dive_toggle_line(),
                 KeyCode::Char('V') => self.dive_toggle_hunk(),
+                KeyCode::Char('x') => self.dive_toggle_flag(),
+                KeyCode::Char('c') => self.dive_open_comment(),
+                KeyCode::Char('C') => self.send_comments(),
                 KeyCode::Enter | KeyCode::Esc => {
                     self.mode = Mode::Steps;
                     self.dive_file = None;
@@ -648,7 +686,7 @@ impl App {
                     && let Some(text) = &notes_text {
                         draw_notes_popup(frame, area, text);
                     }
-                if let Some(buf) = &self.ask {
+                if let Some(input) = &self.input {
                     let context = match self.current().anchor() {
                         Some(at) => format!(
                             "slide {}/{} · {at}",
@@ -657,7 +695,7 @@ impl App {
                         ),
                         None => format!("slide {}/{}", self.step + 1, self.deck.steps.len()),
                     };
-                    draw_ask_popup(frame, area, buf, &context);
+                    draw_input_popup(frame, area, input, &context);
                 }
                 if self.help {
                     draw_help(frame, area);
@@ -669,8 +707,12 @@ impl App {
                         .areas(frame.area());
                 self.draw_dive(frame, body);
                 let (s, t) = self.seen_overall();
-                let left = format!(" dive · seen {s}/{t}");
-                let hint = "v line · V hunk · n/p move · ? keys · enter back · q quit ";
+                let mut left = format!(" dive · seen {s}/{t}");
+                let flags = self.flags_overall();
+                if flags > 0 {
+                    left.push_str(&format!(" · flagged {flags}"));
+                }
+                let hint = "v seen · x flag · c comment · C send · ? keys · enter back ";
                 let [l, r] = Layout::horizontal([
                     Constraint::Min(1),
                     Constraint::Length(display_width(hint) as u16),
@@ -678,6 +720,13 @@ impl App {
                 .areas(status);
                 frame.render_widget(Paragraph::new(left).style(Style::new().dim()), l);
                 frame.render_widget(Paragraph::new(hint).style(Style::new().dim()), r);
+                if let Some(input) = &self.input {
+                    let context = match &input.kind {
+                        InputKind::Comment { file, .. } => file.clone(),
+                        InputKind::Ask => String::new(),
+                    };
+                    draw_input_popup(frame, body, input, &context);
+                }
                 if self.help {
                     draw_help(frame, body);
                 }
@@ -691,11 +740,15 @@ impl App {
         // meter may not.
         let (s, t) = self.seen_overall();
         let mut left = format!(
-            " {}/{} · seen {s}/{t} · {}",
+            " {}/{} · seen {s}/{t}",
             self.step + 1,
             self.deck.steps.len(),
-            step.type_name()
         );
+        let flags = self.flags_overall();
+        if flags > 0 {
+            left.push_str(&format!(" · flagged {flags}"));
+        }
+        left.push_str(&format!(" · {}", step.type_name()));
         if let Some(at) = step.anchor() {
             left.push_str(&format!(" · {at}"));
         }
@@ -943,6 +996,10 @@ impl App {
                 .unwrap_or((0, 0));
             // Words, not glyphs: "deck 5/9" is the deck-explained part and
             // its progress, "rest 374" the unexplained lines still unseen.
+            let flags = hashes
+                .get(path)
+                .map(|pairs| seen.flag_count_cached(path, pairs))
+                .unwrap_or(0);
             let mut suffix: Vec<Span<'static>> = Vec::new();
             if t > 0 {
                 if s == t {
@@ -978,6 +1035,12 @@ impl App {
                         ));
                     }
                 }
+                if flags > 0 {
+                    suffix.push(Span::styled(
+                        format!(" ⚑{flags}"),
+                        Style::new().yellow(),
+                    ));
+                }
             }
             let suffix_w: usize = suffix.iter().map(|s| display_width(&s.content)).sum();
             let name_w = inner_w.saturating_sub(suffix_w + indent.len() + 1);
@@ -1007,12 +1070,14 @@ impl App {
             false,
         ));
         let seen_store = &self.seen;
+        // h hides only what needs no more attention: fully seen and
+        // carrying no flags.
         let fully_seen = |path: &str| -> bool {
             hashes
                 .get(path)
                 .map(|pairs| {
                     let (s, t) = seen_store.progress_cached(path, pairs);
-                    t > 0 && s == t
+                    t > 0 && s == t && seen_store.flag_count_cached(path, pairs) == 0
                 })
                 .unwrap_or(false)
         };
@@ -1534,6 +1599,13 @@ impl App {
                         changed_total: total,
                         new_no: line.new_no,
                     });
+                    // Filler rows for the comment callouts the display
+                    // inserts under this line.
+                    if let Some(i) = idx {
+                        for _ in self.comments.get(&fd.new_path, &hash, i) {
+                            meta.push(DiveMeta::header());
+                        }
+                    }
                 }
                 meta.push(DiveMeta::header());
             }
@@ -1588,6 +1660,65 @@ impl App {
 
     fn hashes_of(&self, file: &str) -> &[(String, usize)] {
         self.hashes.get(file).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// `x` in the dive: flag the changed line under the cursor as
+    /// come-back-to-this. Raising the flag marks the line seen too.
+    fn dive_toggle_flag(&mut self) {
+        let Mode::Dive { cursor, .. } = self.mode else {
+            return;
+        };
+        let meta = self.dive_meta();
+        let Some(m) = meta.get(cursor) else { return };
+        if let (Some(file), Some(hash), Some(idx)) = (&m.file, &m.hunk_hash, m.changed_idx) {
+            self.seen.toggle_flag(file, hash, idx);
+        }
+    }
+
+    /// `c` in the dive: open the comment input for the changed line under
+    /// the cursor.
+    fn dive_open_comment(&mut self) {
+        let Mode::Dive { cursor, .. } = self.mode else {
+            return;
+        };
+        let meta = self.dive_meta();
+        let Some(m) = meta.get(cursor) else { return };
+        if let (Some(file), Some(hash), Some(idx)) = (&m.file, &m.hunk_hash, m.changed_idx) {
+            self.input = Some(InputBox {
+                kind: InputKind::Comment {
+                    file: file.clone(),
+                    hash: hash.clone(),
+                    idx,
+                },
+                buf: String::new(),
+            });
+        }
+    }
+
+    /// `C`: hand every comment, anchors resolved, to the agent — the same
+    /// delivery as a question.
+    fn send_comments(&mut self) {
+        if self.comments.is_empty() {
+            self.toast = Some("no comments yet".to_string());
+            return;
+        }
+        let bundle = self.comments.bundle(&self.files);
+        self.toast = Some(format!(
+            "{} comment(s): {}",
+            self.comments.count(),
+            deliver_ask(&bundle)
+        ));
+    }
+
+    /// Flags alive across the whole diff.
+    fn flags_overall(&self) -> usize {
+        self.files
+            .iter()
+            .map(|fd| {
+                self.seen
+                    .flag_count_cached(&fd.new_path, self.hashes_of(&fd.new_path))
+            })
+            .sum()
     }
 
     /// (seen, total) changed lines across the whole diff.
@@ -1649,9 +1780,14 @@ impl App {
                 let mut changed_idx = 0usize;
                 for (line, seg) in hunk.lines.iter().zip(segs) {
                     let is_changed = line.kind != LineKind::Context;
+                    let line_flagged = is_changed
+                        && self.seen.is_flagged(&fd.new_path, &hash, changed_idx);
                     let line_seen = is_changed
+                        && !line_flagged
                         && self.seen.is_seen(&fd.new_path, &hash, changed_idx);
-                    let mark = if line_seen {
+                    let mark = if line_flagged {
+                        Span::styled("⚑ ", Style::new().yellow())
+                    } else if line_seen {
                         Span::styled("✓ ", Style::new().green().dim())
                     } else {
                         Span::raw("  ")
@@ -1666,7 +1802,8 @@ impl App {
                     let mut spans = vec![mark, Span::styled(no, Style::new().dim())];
                     if line_seen {
                         // A seen change sinks like context: the vivid tint
-                        // is reserved for what is still unreviewed.
+                        // is reserved for what is still unreviewed — and
+                        // for flagged lines, which stay loud on purpose.
                         spans.extend(code_spans(lang, &line.text, LineKind::Context, None));
                     } else {
                         spans.extend(code_spans(lang, &line.text, line.kind, Some(&seg)));
@@ -1677,6 +1814,15 @@ impl App {
                     }
                     lines.push(out);
                     if is_changed {
+                        // Reader comments hang under their line, and must
+                        // stay in step with dive_meta's filler rows.
+                        for text in self.comments.get(&fd.new_path, &hash, changed_idx) {
+                            lines.push(Line::from(vec![
+                                Span::raw("        "),
+                                Span::styled("└ ", Style::new().yellow()),
+                                Span::styled(text.clone(), Style::new().yellow()),
+                            ]));
+                        }
                         changed_idx += 1;
                     }
                 }
@@ -2099,8 +2245,13 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
-/// The question input floating over the slide.
-fn draw_ask_popup(frame: &mut Frame, area: Rect, buf: &str, context: &str) {
+/// The text input floating over the slide or dive.
+fn draw_input_popup(frame: &mut Frame, area: Rect, input: &InputBox, context: &str) {
+    let buf = input.buf.as_str();
+    let title = match &input.kind {
+        InputKind::Ask => " ask an agent · enter send · esc cancel ",
+        InputKind::Comment { .. } => " comment on this line · enter save · esc cancel ",
+    };
     let width = area.width.saturating_sub(8).clamp(20, 80);
     let [_, mid, _] = Layout::vertical([
         Constraint::Fill(1),
@@ -2123,10 +2274,7 @@ fn draw_ask_popup(frame: &mut Frame, area: Rect, buf: &str, context: &str) {
             Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(ACCENT))
-                .title(Span::styled(
-                    " ask an agent · enter send · esc cancel ",
-                    Style::new().fg(ACCENT),
-                )),
+                .title(Span::styled(title, Style::new().fg(ACCENT))),
         ),
         popup,
     );
@@ -2148,10 +2296,13 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("file list", ""),
         ("deck 5/9", "deck-explained lines: seen / shown"),
         ("rest n", "unexplained lines still unseen"),
+        ("⚑ n", "flagged lines in the file"),
         ("✓", "whole file seen"),
         ("dive", ""),
         ("n / p", "move the cursor"),
         ("v / V", "mark line / hunk seen"),
+        ("x", "flag: come back to this line"),
+        ("c / C", "comment on the line / send all comments"),
         ("enter / esc", "back to the slides"),
         ("everywhere", ""),
         ("?", "this help"),
@@ -2257,7 +2408,8 @@ diff --git a/src/lib.rs b/src/lib.rs
             dive_file: None,
             sidebar_area: Rect::default(),
             focus: Focus::Slides,
-            ask: None,
+            input: None,
+            comments: CommentStore::load(None),
             help: false,
             toast: None,
             sidebar_cursor: 0,
@@ -2839,12 +2991,15 @@ diff --git a/f.rs b/f.rs
             notes: vec![],
             speaker_notes: None,
         }]);
-        app.ask = Some("why".into());
+        app.input = Some(InputBox {
+            kind: InputKind::Ask,
+            buf: "why".into(),
+        });
         let s = screen(&mut app);
         assert!(s.contains(" ask an agent · enter send · esc cancel "), "{s}");
         assert!(s.contains("> why▏"), "{s}");
 
-        app.ask = None;
+        app.input = None;
         app.help = true;
         let s = screen(&mut app);
         assert!(s.contains(" keys "), "{s}");
@@ -2933,6 +3088,61 @@ diff --git a/f.rs b/f.rs
             app.sidebar_cursor,
             (before + 1).min(app.sidebar_items.len() - 1)
         );
+    }
+
+    #[test]
+    fn x_flags_a_line_loud_and_c_comments_it() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        app.enter_dive();
+        app.dive_toggle_flag();
+        let s = screen(&mut app);
+        assert!(s.contains("⚑"), "flag mark missing:\n{s}");
+        assert!(s.contains("flagged 1"), "status flag count missing:\n{s}");
+        // Flag implies seen but the line stays vivid (not sunk): the add
+        // still renders with its background tint.
+        let fd = file_diff(&app.files, "src/lib.rs").cloned().unwrap();
+        assert_eq!(app.seen.progress_for(&fd), (1, 2));
+
+        // Comment via the input box.
+        app.dive_open_comment();
+        assert!(matches!(
+            app.input,
+            Some(InputBox {
+                kind: InputKind::Comment { .. },
+                ..
+            })
+        ));
+        for ch in "naming?".chars() {
+            let _ = app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+        let _ = app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.comments.count(), 1);
+        let s = screen(&mut app);
+        assert!(s.contains("└ naming?"), "comment callout missing:\n{s}");
+
+        // The bundle resolves the anchor to the current line number.
+        let bundle = app.comments.bundle(&app.files);
+        assert!(bundle.contains("src/lib.rs:11"), "{bundle}");
+        assert!(bundle.contains("naming?"), "{bundle}");
+
+        // Flagged files never hide under h.
+        app.mode = Mode::Steps;
+        app.dive_file = None;
+        app.seen.toggle_file(&fd); // complete the file
+        app.hide_seen = true;
+        let s = screen(&mut app);
+        assert!(s.contains("⚑1"), "flagged file must stay listed:\n{s}");
     }
 
     #[test]

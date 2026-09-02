@@ -10,8 +10,10 @@ const USAGE: &str = "\
 slidiff — a deck an agent writes, a person reads in the terminal
 
 usage:
-  slidiff <deck.md|yaml>      view a deck (n/p step, Enter dive into full diff, q quit)
+  slidiff <deck.md|yaml>      view a deck (press ? inside for the keymap)
   slidiff check <deck.md|yaml>  validate a deck, exit 1 with what to fix
+  slidiff comments [deck]     print the review comments as markdown
+                              (anchors resolved; [deck] supplies the diff base)
   slidiff schema              print the deck JSON Schema
 ";
 
@@ -23,6 +25,7 @@ fn main() -> ExitCode {
             Ok(ExitCode::SUCCESS)
         }
         Some("schema") => cmd_schema(),
+        Some("comments") => cmd_comments(args.get(1).map(Path::new)),
         Some("check") => match args.get(1) {
             Some(path) => cmd_check(Path::new(path)),
             None => {
@@ -75,6 +78,25 @@ fn cmd_check(path: &Path) -> Result<ExitCode> {
         eprintln!("{error}");
     }
     Ok(ExitCode::FAILURE)
+}
+
+/// The review comments as one markdown bundle — what an agent reads to
+/// pick up the reader's feedback without the TUI.
+fn cmd_comments(deck_path: Option<&Path>) -> Result<ExitCode> {
+    let cwd = std::env::current_dir().context("cannot read current dir")?;
+    let repo = slidiff::diff::Repo::discover(&cwd)?;
+    let base = match deck_path {
+        Some(p) => load_deck(p)?.base,
+        None => None,
+    };
+    let files = slidiff::diff::load_diff(&repo, base.as_deref())?;
+    let comments = slidiff::comments::CommentStore::load(repo.git_dir());
+    if comments.is_empty() {
+        println!("no comments");
+        return Ok(ExitCode::SUCCESS);
+    }
+    print!("{}", comments.bundle(&files));
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_view(path: &Path) -> Result<ExitCode> {

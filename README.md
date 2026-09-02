@@ -3,6 +3,11 @@
 A slide deck an agent writes and a person reads in the terminal, one claim to a
 screen.
 
+![slidiff demo](demo.gif)
+
+*The demo deck describes this repository itself — try it with
+`cargo install slidiff && slidiff examples/demo.md` from a checkout.*
+
 A deck holds no code. Every step points at a `file:start-end` range, and the
 viewer draws those lines out of the repository at display time — syntax
 highlighted, diff-aware with word-level emphasis, context dimmed — so what is

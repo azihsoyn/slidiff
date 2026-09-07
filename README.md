@@ -3,10 +3,26 @@
 A slide deck an agent writes and a person reads in the terminal, one claim to a
 screen.
 
-![slidiff demo](demo.gif)
+![slidiff demo](https://raw.githubusercontent.com/azihsoyn/slidiff/main/demo.gif)
 
 *The demo deck describes this repository itself — try it with
 `cargo install slidiff && slidiff examples/demo.md` from a checkout.*
+
+## Why
+
+As agents write more of the code,
+[understanding is the new bottleneck](https://www.geoffreylitt.com/2026/07/02/understanding-is-the-new-bottleneck):
+changes land faster than anyone builds a mental model of them, and skimming
+walls of prose or raw diffs quietly accumulates cognitive debt — code you
+approved but could not steer.
+
+slidiff is a medium for paying that debt down. The agent explains its change
+as a literate tour ordered by meaning, not by filename; every claim is
+anchored to real hunks so the explanation cannot drift from the code; the
+format refuses prose you would only skim; the coverage meter admits what the
+tour skipped; and seen, flag, and comment marks turn "I looked at it" into a
+durable, content-addressed record that survives rebases and comes back to
+the agent as actionable feedback.
 
 A deck holds no code. Every step points at a `file:start-end` range, and the
 viewer draws those lines out of the repository at display time — syntax

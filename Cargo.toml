@@ -8,6 +8,7 @@ edition = "2024"
 description = "A slide deck an agent writes and a person reads in the terminal — slides point at file:line, the viewer draws the real diff, and review progress travels back"
 license = "MIT"
 repository = "https://github.com/azihsoyn/slidiff"
+homepage = "https://github.com/azihsoyn/slidiff"
 readme = "README.md"
 keywords = ["diff", "review", "tui", "slides", "agent"]
 categories = ["command-line-utilities", "development-tools"]
@@ -25,3 +26,8 @@ serde_yaml = "0.9.34"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

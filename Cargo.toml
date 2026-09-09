@@ -3,7 +3,7 @@ members = [".", "crates/diffseen"]
 
 [package]
 name = "slidiff"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "A slide deck an agent writes and a person reads in the terminal — slides point at file:line, the viewer draws the real diff, and review progress travels back"
 license = "MIT"

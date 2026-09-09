@@ -98,6 +98,14 @@ impl SeenStore {
 }
 
 impl SeenStore {
+    /// Force every changed line of the file seen (never clears) — for
+    /// importing an external file-level "viewed" state.
+    pub fn mark_file_seen(&mut self, fd: &FileDiff) {
+        for (key, hunk) in hunk_keys(fd).iter().zip(&fd.hunks) {
+            self.0.set_hunk(&fd.new_path, key, changed_count(hunk), true);
+        }
+    }
+
     /// Fully reviewed and carrying no come-back flags — the state worth
     /// mirroring to an external "viewed" checkbox.
     pub fn file_is_done(&self, fd: &FileDiff) -> bool {

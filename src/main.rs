@@ -17,6 +17,8 @@ usage:
   slidiff viewed [deck] [--pr N] [--dry-run]
                               mark files that are fully seen locally (and
                               carry no flags) as Viewed on the GitHub PR
+  slidiff viewed --pull ...   the other direction: files marked Viewed on
+                              the PR become fully seen locally
   slidiff schema              print the deck JSON Schema
 ";
 
@@ -100,10 +102,12 @@ fn cmd_viewed(args: &[String]) -> Result<ExitCode> {
     let mut deck_path: Option<&Path> = None;
     let mut pr: Option<&str> = None;
     let mut dry_run = false;
+    let mut pull = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
+            "--pull" => pull = true,
             "--pr" => pr = Some(it.next().context("--pr needs a number")?.as_str()),
             other => deck_path = Some(Path::new(other)),
         }
@@ -124,7 +128,7 @@ fn cmd_viewed(args: &[String]) -> Result<ExitCode> {
     if let Some(pr) = pr {
         view.arg(pr);
     }
-    view.args(["--json", "id,number,files"]);
+    view.args(["--json", "id,number,url,files"]);
     let out = view.output().context("cannot run gh — is it installed?")?;
     if !out.status.success() {
         anyhow::bail!(
@@ -135,6 +139,10 @@ fn cmd_viewed(args: &[String]) -> Result<ExitCode> {
     let pr_info: serde_json::Value = serde_json::from_slice(&out.stdout)?;
     let pr_id = pr_info["id"].as_str().context("PR has no id")?;
     let pr_number = pr_info["number"].as_u64().unwrap_or(0);
+
+    if pull {
+        return pull_viewed(&pr_info, &files, &mut slidiff::seen::SeenStore::load(repo.git_dir()), dry_run);
+    }
     let pr_files: std::collections::HashSet<&str> = pr_info["files"]
         .as_array()
         .map(|a| a.iter().filter_map(|f| f["path"].as_str()).collect())
@@ -182,6 +190,75 @@ fn cmd_viewed(args: &[String]) -> Result<ExitCode> {
         }
     }
     println!("marked {marked}/{} file(s) viewed on PR #{pr_number}", done.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// GitHub → local: every PR file the viewer marked Viewed becomes fully
+/// seen here. One-way — an unviewed checkbox never erases line-level
+/// progress, and flags/comments stay untouched.
+fn pull_viewed(
+    pr_info: &serde_json::Value,
+    files: &[slidiff::diff::FileDiff],
+    seen: &mut slidiff::seen::SeenStore,
+    dry_run: bool,
+) -> Result<ExitCode> {
+    let pr_number = pr_info["number"].as_u64().unwrap_or(0);
+    let url = pr_info["url"].as_str().context("PR has no url")?;
+    // https://github.com/OWNER/REPO/pull/N
+    let parts: Vec<&str> = url.trim_start_matches("https://").split('/').collect();
+    let (owner, name) = (
+        parts.get(1).context("bad PR url")?,
+        parts.get(2).context("bad PR url")?,
+    );
+    let out = std::process::Command::new("gh")
+        .args([
+            "api", "graphql", "--paginate",
+            "-f",
+            "query=query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){files(first:100,after:$endCursor){nodes{path viewerViewedState}pageInfo{hasNextPage endCursor}}}}}",
+            "-f",
+        ])
+        .arg(format!("owner={owner}"))
+        .arg("-f")
+        .arg(format!("name={name}"))
+        .arg("-F")
+        .arg(format!("number={pr_number}"))
+        .arg("--jq")
+        .arg(".data.repository.pullRequest.files.nodes[] | select(.viewerViewedState==\"VIEWED\") | .path")
+        .output()
+        .context("cannot run gh")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "gh api graphql failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let viewed: std::collections::HashSet<&str> =
+        std::str::from_utf8(&out.stdout)?.lines().collect();
+
+    let mut imported = 0;
+    let mut already = 0;
+    for fd in files {
+        if !viewed.contains(fd.new_path.as_str()) {
+            continue;
+        }
+        let (s, t) = seen.progress_for(fd);
+        if t == 0 || s == t {
+            already += 1;
+            continue;
+        }
+        if dry_run {
+            println!("would mark seen locally: {} ({} lines)", fd.new_path, t - s);
+        } else {
+            seen.mark_file_seen(fd);
+            println!("seen: {} ({} lines imported)", fd.new_path, t - s);
+        }
+        imported += 1;
+    }
+    println!(
+        "PR #{pr_number}: {} viewed on GitHub · {imported} imported{} · {already} already seen",
+        viewed.len(),
+        if dry_run { " (dry run)" } else { "" },
+    );
     Ok(ExitCode::SUCCESS)
 }
 

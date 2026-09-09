@@ -2413,24 +2413,46 @@ fn draw_input_popup(frame: &mut Frame, area: Rect, input: &InputBox, context: &s
         InputKind::Comment { .. } => " comment on this line · enter save · esc cancel ",
     };
     let width = area.width.saturating_sub(8).clamp(20, 80);
+    // Grow with the text — a wrapped question must stay visible while it
+    // is being typed. Wrapping is done here (not by Paragraph) so the row
+    // count is exact; if even the grown popup overflows, the cursor end wins.
+    let inner_w = usize::from(width.saturating_sub(2).max(4));
+    let mut lines: Vec<Line> = wrap_display(context, inner_w)
+        .into_iter()
+        .map(|r| Line::from(r).style(Style::new().dim()))
+        .collect();
+    let input_rows = wrap_display(&format!("{buf}▏"), inner_w.saturating_sub(2));
+    let last = input_rows.len() - 1;
+    for (i, row) in input_rows.into_iter().enumerate() {
+        let prompt = if i == 0 { "> " } else { "  " };
+        let mut spans = vec![Span::styled(prompt, Style::new().fg(ACCENT))];
+        let mut rest = row;
+        if i == last {
+            rest.pop(); // the ▏ cursor, re-added styled
+            spans.push(Span::raw(rest));
+            spans.push(Span::styled("▏", Style::new().fg(ACCENT)));
+        } else {
+            spans.push(Span::raw(rest));
+        }
+        lines.push(Line::from(spans));
+    }
+    let height =
+        (lines.len() as u16 + 2).clamp(4, (area.height.saturating_mul(3) / 4).max(4));
+    let visible = usize::from(height - 2);
+    if lines.len() > visible {
+        lines.drain(..lines.len() - visible);
+    }
     let [_, mid, _] = Layout::vertical([
         Constraint::Fill(1),
-        Constraint::Length(4),
+        Constraint::Length(height),
         Constraint::Fill(1),
     ])
     .areas(area);
     let popup = center_h(mid, width);
     frame.render_widget(Clear, popup);
-    let lines = vec![
-        Line::from(context.to_string()).style(Style::new().dim()),
-        Line::from(vec![
-            Span::styled("> ", Style::new().fg(ACCENT)),
-            Span::raw(buf.to_string()),
-            Span::styled("▏", Style::new().fg(ACCENT)),
-        ]),
-    ];
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Paragraph::new(lines)
+            .block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(ACCENT))
@@ -3203,6 +3225,29 @@ diff --git a/f.rs b/f.rs
         assert!(s.contains(" keys "), "{s}");
         assert!(s.contains("ask an agent about this slide"), "{s}");
         assert!(s.contains("mark line / hunk seen"), "{s}");
+    }
+
+    #[test]
+    fn long_question_stays_visible_while_typing() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        // Long Japanese question: wraps well past one popup row.
+        app.input = Some(InputBox {
+            kind: InputKind::Ask,
+            buf: format!("{}終端", "こ".repeat(120)),
+        });
+        let s = screen(&mut app);
+        // Wide glyphs render with a trailing continuation cell, so match
+        // the pieces, not the contiguous string.
+        assert!(
+            s.contains('終') && s.contains('▏'),
+            "the cursor end must be visible:\n{s}"
+        );
+        assert!(!s.contains("> >"), "prompt must not double up:\n{s}");
     }
 
     #[test]

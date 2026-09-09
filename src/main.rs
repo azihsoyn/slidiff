@@ -122,45 +122,24 @@ fn cmd_viewed(args: &[String]) -> Result<ExitCode> {
     let files = slidiff::diff::load_diff(&repo, base.as_deref())?;
     let seen = slidiff::seen::SeenStore::load(repo.git_dir());
 
-    // The PR's identity and file list, through gh.
-    let mut view = std::process::Command::new("gh");
-    view.args(["pr", "view"]);
-    if let Some(pr) = pr {
-        view.arg(pr);
-    }
-    view.args(["--json", "id,number,url,files"]);
-    let out = view.output().context("cannot run gh — is it installed?")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "gh pr view failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let pr_info: serde_json::Value = serde_json::from_slice(&out.stdout)?;
-    let pr_id = pr_info["id"].as_str().context("PR has no id")?;
-    let pr_number = pr_info["number"].as_u64().unwrap_or(0);
-
+    let pr = slidiff::ghsync::pr_info(pr)?;
     if pull {
-        return pull_viewed(&pr_info, &files, &mut slidiff::seen::SeenStore::load(repo.git_dir()), dry_run);
+        return pull_viewed(&pr, &files, &mut slidiff::seen::SeenStore::load(repo.git_dir()), dry_run);
     }
-    let pr_files: std::collections::HashSet<&str> = pr_info["files"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|f| f["path"].as_str()).collect())
-        .unwrap_or_default();
 
     let done: Vec<&str> = files
         .iter()
-        .filter(|fd| pr_files.contains(fd.new_path.as_str()))
+        .filter(|fd| pr.files.contains(fd.new_path.as_str()))
         .filter(|fd| seen.file_is_done(fd))
         .map(|fd| fd.new_path.as_str())
         .collect();
 
     if done.is_empty() {
-        println!("no fully seen, unflagged files intersect PR #{pr_number}");
+        println!("no fully seen, unflagged files intersect PR #{}", pr.number);
         return Ok(ExitCode::SUCCESS);
     }
     if dry_run {
-        println!("would mark viewed on PR #{pr_number}:");
+        println!("would mark viewed on PR #{}:", pr.number);
         for path in &done {
             println!("  {path}");
         }
@@ -168,28 +147,14 @@ fn cmd_viewed(args: &[String]) -> Result<ExitCode> {
     }
     let mut marked = 0;
     for path in &done {
-        let status = std::process::Command::new("gh")
-            .args([
-                "api",
-                "graphql",
-                "-f",
-                "query=mutation($pr:ID!,$path:String!){markFileAsViewed(input:{pullRequestId:$pr,path:$path}){clientMutationId}}",
-                "-f",
-            ])
-            .arg(format!("pr={pr_id}"))
-            .arg("-f")
-            .arg(format!("path={path}"))
-            .stdout(std::process::Stdio::null())
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                marked += 1;
-                println!("viewed: {path}");
-            }
-            _ => eprintln!("failed to mark: {path}"),
+        if slidiff::ghsync::mark_viewed(&pr.id, path) {
+            marked += 1;
+            println!("viewed: {path}");
+        } else {
+            eprintln!("failed to mark: {path}");
         }
     }
-    println!("marked {marked}/{} file(s) viewed on PR #{pr_number}", done.len());
+    println!("marked {marked}/{} file(s) viewed on PR #{}", done.len(), pr.number);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -197,43 +162,13 @@ fn cmd_viewed(args: &[String]) -> Result<ExitCode> {
 /// seen here. One-way — an unviewed checkbox never erases line-level
 /// progress, and flags/comments stay untouched.
 fn pull_viewed(
-    pr_info: &serde_json::Value,
+    pr: &slidiff::ghsync::Pr,
     files: &[slidiff::diff::FileDiff],
     seen: &mut slidiff::seen::SeenStore,
     dry_run: bool,
 ) -> Result<ExitCode> {
-    let pr_number = pr_info["number"].as_u64().unwrap_or(0);
-    let url = pr_info["url"].as_str().context("PR has no url")?;
-    // https://github.com/OWNER/REPO/pull/N
-    let parts: Vec<&str> = url.trim_start_matches("https://").split('/').collect();
-    let (owner, name) = (
-        parts.get(1).context("bad PR url")?,
-        parts.get(2).context("bad PR url")?,
-    );
-    let out = std::process::Command::new("gh")
-        .args([
-            "api", "graphql", "--paginate",
-            "-f",
-            "query=query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){files(first:100,after:$endCursor){nodes{path viewerViewedState}pageInfo{hasNextPage endCursor}}}}}",
-            "-f",
-        ])
-        .arg(format!("owner={owner}"))
-        .arg("-f")
-        .arg(format!("name={name}"))
-        .arg("-F")
-        .arg(format!("number={pr_number}"))
-        .arg("--jq")
-        .arg(".data.repository.pullRequest.files.nodes[] | select(.viewerViewedState==\"VIEWED\") | .path")
-        .output()
-        .context("cannot run gh")?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "gh api graphql failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let viewed: std::collections::HashSet<&str> =
-        std::str::from_utf8(&out.stdout)?.lines().collect();
+    let pr_number = pr.number;
+    let viewed = slidiff::ghsync::viewed_paths(pr)?;
 
     let mut imported = 0;
     let mut already = 0;

@@ -1,6 +1,7 @@
 pub mod comments;
 pub mod deck;
 pub mod diff;
+pub mod ghsync;
 pub mod highlight;
 pub mod md;
 pub mod mdeck;

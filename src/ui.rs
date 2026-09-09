@@ -80,7 +80,12 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
         watch_at: std::time::Instant::now(),
         fingerprint,
         deck_mtime,
+        sync_rx: None,
+        sync_quiet: false,
     };
+    // Import GitHub's Viewed checkboxes while the reader gets going.
+    // Pull-only: opening a deck must not publish local state outward.
+    app.start_sync(false, true);
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     // Kitty keyboard protocol, where the terminal has it: makes
@@ -213,6 +218,12 @@ struct App {
     /// Per file, the changed lines some slide's excerpt shows — "what the
     /// deck explains", as opposed to the rest of the diff.
     covered: HashMap<String, std::collections::HashSet<(String, usize)>>,
+    /// A GitHub Viewed sync in flight, if any — gh runs off-thread and
+    /// the result comes home through this channel.
+    sync_rx: Option<std::sync::mpsc::Receiver<Result<crate::ghsync::SyncReport, String>>>,
+    /// A quiet sync (the automatic pull on open) stays silent unless it
+    /// imported something — no PR on the branch is not news.
+    sync_quiet: bool,
 }
 
 /// Which changed lines the deck's excerpts actually display, per file.
@@ -412,6 +423,7 @@ impl App {
             if self.watch_at.elapsed() >= std::time::Duration::from_secs(2) {
                 self.watch_tick();
             }
+            self.poll_sync();
             terminal.draw(|frame| self.draw(frame))?;
             // Wait briefly for input; waking with none lets the watch run.
             if !event::poll(std::time::Duration::from_millis(300))? {
@@ -428,6 +440,89 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Kick off a GitHub Viewed sync on its own thread. `push` also
+    /// checks off files that are fully seen and unflagged here; the pull
+    /// direction always happens. Quiet syncs only speak when they act.
+    fn start_sync(&mut self, push: bool, quiet: bool) {
+        if self.sync_rx.is_some() {
+            if !quiet {
+                self.toast = Some("viewed sync already running".to_string());
+            }
+            return;
+        }
+        let push_done: Vec<String> = if push {
+            self.files
+                .iter()
+                .filter(|fd| self.seen.file_is_done(fd))
+                .map(|fd| fd.new_path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.sync_rx = Some(rx);
+        self.sync_quiet = quiet;
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::ghsync::sync(&push_done).map_err(|e| format!("{e:#}")));
+        });
+        if !quiet {
+            self.toast = Some("syncing viewed with GitHub…".to_string());
+        }
+    }
+
+    /// Collect a finished sync, if one landed since the last tick.
+    fn poll_sync(&mut self) {
+        let Some(rx) = &self.sync_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok(report)) => {
+                self.sync_rx = None;
+                self.apply_sync(&report);
+            }
+            Ok(Err(err)) => {
+                self.sync_rx = None;
+                if !self.sync_quiet {
+                    self.toast = Some(format!("viewed sync failed: {err}"));
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.sync_rx = None,
+        }
+    }
+
+    /// GitHub → local import half: files Viewed there become fully seen
+    /// here. One-way — an unchecked box never erases line-level marks.
+    fn apply_sync(&mut self, report: &crate::ghsync::SyncReport) {
+        let mut imported = 0;
+        for fd in &self.files {
+            if !report.viewed.contains(&fd.new_path) {
+                continue;
+            }
+            let (s, t) = self.seen.progress_for(fd);
+            if t == 0 || s == t {
+                continue;
+            }
+            self.seen.mark_file_seen(fd);
+            imported += 1;
+        }
+        if self.sync_quiet && imported == 0 {
+            return;
+        }
+        let mut parts = vec![format!("PR #{}", report.number)];
+        if imported > 0 {
+            parts.push(format!("{imported} imported"));
+        }
+        if report.pushed > 0 {
+            parts.push(format!("{} pushed", report.pushed));
+        }
+        if report.push_failed > 0 {
+            parts.push(format!("{} push failed", report.push_failed));
+        }
+        if parts.len() == 1 {
+            parts.push("viewed already in sync".to_string());
+        }
+        self.toast = Some(parts.join(" · "));
     }
 
     /// The deck and the diff both keep moving while an agent works; pick
@@ -554,6 +649,11 @@ impl App {
         }
         if key.code == KeyCode::Char('q') {
             return Ok(true);
+        }
+        // Sync works from any screen — it is about the review, not a view.
+        if key.code == KeyCode::Char('g') {
+            self.start_sync(true, false);
+            return Ok(false);
         }
         match &mut self.mode {
             Mode::Steps if self.focus == Focus::Sidebar => match key.code {
@@ -2501,6 +2601,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("c / C", "comment on the line / send all comments"),
         ("enter / esc", "back to the slides"),
         ("everywhere", ""),
+        ("g", "sync viewed with the GitHub PR, both ways"),
         ("?", "this help"),
         ("q", "quit · mouse: click and wheel work"),
     ];
@@ -2618,6 +2719,8 @@ diff --git a/src/lib.rs b/src/lib.rs
             deck_mtime: None,
             hashes,
             covered,
+            sync_rx: None,
+            sync_quiet: false,
         }
     }
 
@@ -3242,6 +3345,47 @@ diff --git a/f.rs b/f.rs
     }
 
     #[test]
+    fn sync_report_imports_viewed_files_as_seen() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        let fd = app.files[0].clone();
+        assert_eq!(app.seen.progress_for(&fd).0, 0);
+
+        let report = crate::ghsync::SyncReport {
+            number: 7,
+            viewed: std::iter::once(fd.new_path.clone()).collect(),
+            pushed: 0,
+            push_failed: 0,
+        };
+        app.apply_sync(&report);
+        let (s, t) = app.seen.progress_for(&fd);
+        assert_eq!(s, t, "viewed file must become fully seen");
+        let toast = app.toast.as_deref().unwrap();
+        assert!(toast.contains("PR #7") && toast.contains("imported"), "{toast}");
+
+        // A quiet sync with nothing new to import says nothing.
+        app.sync_quiet = true;
+        app.toast = None;
+        app.apply_sync(&report);
+        assert_eq!(app.toast, None);
+
+        // A file GitHub never saw stays untouched.
+        let stranger = crate::ghsync::SyncReport {
+            number: 7,
+            viewed: std::iter::once("other.rs".to_string()).collect(),
+            pushed: 0,
+            push_failed: 0,
+        };
+        let mut fresh = app_with(vec![]);
+        fresh.apply_sync(&stranger);
+        assert_eq!(fresh.seen.progress_for(&fresh.files[0].clone()).0, 0);
+    }
+
+    #[test]
     fn shift_enter_inserts_a_newline_instead_of_sending() {
         let mut app = app_with(vec![Step::Point {
             at: "src/lib.rs:11".parse().unwrap(),
@@ -3545,6 +3689,8 @@ diff --git a/src/lib.rs b/src/lib.rs
             deck_mtime: None,
             hashes,
             covered,
+            sync_rx: None,
+            sync_quiet: false,
         };
         app.slide_toggle_seen();
         let keys = crate::seen::hunk_keys(&app.files[0]);

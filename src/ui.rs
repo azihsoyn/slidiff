@@ -83,7 +83,15 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
     };
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Kitty keyboard protocol, where the terminal has it: makes
+    // shift+enter distinct from enter so text inputs can take newlines.
+    // Elsewhere this is ignored and shift+enter just sends.
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        event::PushKeyboardEnhancementFlags(event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let result = app.event_loop(&mut terminal);
+    let _ = crossterm::execute!(std::io::stdout(), event::PopKeyboardEnhancementFlags);
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -508,6 +516,9 @@ impl App {
         if let Some(input) = &mut self.input {
             match key.code {
                 KeyCode::Esc => self.input = None,
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    input.buf.push('\n');
+                }
                 KeyCode::Enter => {
                     let InputBox { kind, buf } = self.input.take().unwrap();
                     match kind {
@@ -2409,8 +2420,8 @@ fn base64(data: &[u8]) -> String {
 fn draw_input_popup(frame: &mut Frame, area: Rect, input: &InputBox, context: &str) {
     let buf = input.buf.as_str();
     let title = match &input.kind {
-        InputKind::Ask => " ask an agent · enter send · esc cancel ",
-        InputKind::Comment { .. } => " comment on this line · enter save · esc cancel ",
+        InputKind::Ask => " ask an agent · enter send · ⇧enter newline · esc cancel ",
+        InputKind::Comment { .. } => " comment on this line · enter save · ⇧enter newline · esc cancel ",
     };
     let width = area.width.saturating_sub(8).clamp(20, 80);
     // Grow with the text — a wrapped question must stay visible while it
@@ -2421,7 +2432,10 @@ fn draw_input_popup(frame: &mut Frame, area: Rect, input: &InputBox, context: &s
         .into_iter()
         .map(|r| Line::from(r).style(Style::new().dim()))
         .collect();
-    let input_rows = wrap_display(&format!("{buf}▏"), inner_w.saturating_sub(2));
+    let input_rows: Vec<String> = format!("{buf}▏")
+        .split('\n')
+        .flat_map(|seg| wrap_display(seg, inner_w.saturating_sub(2)))
+        .collect();
     let last = input_rows.len() - 1;
     for (i, row) in input_rows.into_iter().enumerate() {
         let prompt = if i == 0 { "> " } else { "  " };
@@ -3216,7 +3230,7 @@ diff --git a/f.rs b/f.rs
             buf: "why".into(),
         });
         let s = screen(&mut app);
-        assert!(s.contains(" ask an agent · enter send · esc cancel "), "{s}");
+        assert!(s.contains(" ask an agent · enter send "), "{s}");
         assert!(s.contains("> why▏"), "{s}");
 
         app.input = None;
@@ -3225,6 +3239,36 @@ diff --git a/f.rs b/f.rs
         assert!(s.contains(" keys "), "{s}");
         assert!(s.contains("ask an agent about this slide"), "{s}");
         assert!(s.contains("mark line / hunk seen"), "{s}");
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline_instead_of_sending() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        app.input = Some(InputBox {
+            kind: InputKind::Ask,
+            buf: "first".into(),
+        });
+        let _ = app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+        )));
+        let input = app.input.as_ref().expect("shift+enter must not send");
+        assert_eq!(input.buf, "first\n");
+
+        for c in "second".chars() {
+            let _ = app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        }
+        let s = screen(&mut app);
+        assert!(s.contains("> first"), "{s}");
+        assert!(s.contains("second▏"), "second line with cursor:\n{s}");
     }
 
     #[test]

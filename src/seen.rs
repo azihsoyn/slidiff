@@ -97,6 +97,20 @@ impl SeenStore {
     }
 }
 
+impl SeenStore {
+    /// Fully reviewed and carrying no come-back flags — the state worth
+    /// mirroring to an external "viewed" checkbox.
+    pub fn file_is_done(&self, fd: &FileDiff) -> bool {
+        let keys = hunk_keys(fd);
+        let pairs: Vec<(String, usize)> = keys
+            .into_iter()
+            .zip(fd.hunks.iter().map(changed_count))
+            .collect();
+        let (s, t) = self.progress_cached(&fd.new_path, &pairs);
+        t > 0 && s == t && self.flag_count_cached(&fd.new_path, &pairs) == 0
+    }
+}
+
 pub fn changed_count(hunk: &Hunk) -> usize {
     hunk.lines
         .iter()
@@ -213,6 +227,24 @@ diff --git a/f.rs b/f.rs
         store.toggle_line("f.rs", &keys[0], 0);
         assert!(store.is_seen("f.rs", &keys[0], 0));
         assert!(!store.is_seen("f.rs", &keys[1], 0));
+    }
+
+    #[test]
+    fn file_is_done_requires_all_seen_and_no_flags() {
+        let files = parse_unified(SAMPLE);
+        let fd = &files[0];
+        let mut store = SeenStore::in_memory();
+        assert!(!store.file_is_done(fd));
+
+        store.toggle_file(fd);
+        assert!(store.file_is_done(fd));
+
+        // A flag keeps the file out of "done", even fully seen.
+        let key = hunk_keys(fd)[0].clone();
+        store.toggle_flag("f.rs", &key, 0);
+        assert!(!store.file_is_done(fd));
+        store.toggle_flag("f.rs", &key, 0);
+        assert!(store.file_is_done(fd));
     }
 
     #[test]

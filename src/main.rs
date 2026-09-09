@@ -14,6 +14,9 @@ usage:
   slidiff check <deck.md|yaml>  validate a deck, exit 1 with what to fix
   slidiff comments [deck]     print the review comments as markdown
                               (anchors resolved; [deck] supplies the diff base)
+  slidiff viewed [deck] [--pr N] [--dry-run]
+                              mark files that are fully seen locally (and
+                              carry no flags) as Viewed on the GitHub PR
   slidiff schema              print the deck JSON Schema
 ";
 
@@ -26,6 +29,7 @@ fn main() -> ExitCode {
         }
         Some("schema") => cmd_schema(),
         Some("comments") => cmd_comments(args.get(1).map(Path::new)),
+        Some("viewed") => cmd_viewed(&args[1..]),
         Some("check") => match args.get(1) {
             Some(path) => cmd_check(Path::new(path)),
             None => {
@@ -86,6 +90,98 @@ fn cmd_comments(deck_path: Option<&Path>) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     print!("{}", comments.bundle(&files));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Mirror the local review state to GitHub: every file whose changed
+/// lines are all seen (and unflagged) gets the PR's Viewed checkbox,
+/// via `gh` so authentication stays gh's problem.
+fn cmd_viewed(args: &[String]) -> Result<ExitCode> {
+    let mut deck_path: Option<&Path> = None;
+    let mut pr: Option<&str> = None;
+    let mut dry_run = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            "--pr" => pr = Some(it.next().context("--pr needs a number")?.as_str()),
+            other => deck_path = Some(Path::new(other)),
+        }
+    }
+
+    let cwd = std::env::current_dir().context("cannot read current dir")?;
+    let repo = slidiff::diff::Repo::discover(&cwd)?;
+    let base = match deck_path {
+        Some(p) => load_deck(p)?.base,
+        None => None,
+    };
+    let files = slidiff::diff::load_diff(&repo, base.as_deref())?;
+    let seen = slidiff::seen::SeenStore::load(repo.git_dir());
+
+    // The PR's identity and file list, through gh.
+    let mut view = std::process::Command::new("gh");
+    view.args(["pr", "view"]);
+    if let Some(pr) = pr {
+        view.arg(pr);
+    }
+    view.args(["--json", "id,number,files"]);
+    let out = view.output().context("cannot run gh — is it installed?")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "gh pr view failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let pr_info: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let pr_id = pr_info["id"].as_str().context("PR has no id")?;
+    let pr_number = pr_info["number"].as_u64().unwrap_or(0);
+    let pr_files: std::collections::HashSet<&str> = pr_info["files"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|f| f["path"].as_str()).collect())
+        .unwrap_or_default();
+
+    let done: Vec<&str> = files
+        .iter()
+        .filter(|fd| pr_files.contains(fd.new_path.as_str()))
+        .filter(|fd| seen.file_is_done(fd))
+        .map(|fd| fd.new_path.as_str())
+        .collect();
+
+    if done.is_empty() {
+        println!("no fully seen, unflagged files intersect PR #{pr_number}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if dry_run {
+        println!("would mark viewed on PR #{pr_number}:");
+        for path in &done {
+            println!("  {path}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut marked = 0;
+    for path in &done {
+        let status = std::process::Command::new("gh")
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                "query=mutation($pr:ID!,$path:String!){markFileAsViewed(input:{pullRequestId:$pr,path:$path}){clientMutationId}}",
+                "-f",
+            ])
+            .arg(format!("pr={pr_id}"))
+            .arg("-f")
+            .arg(format!("path={path}"))
+            .stdout(std::process::Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                marked += 1;
+                println!("viewed: {path}");
+            }
+            _ => eprintln!("failed to mark: {path}"),
+        }
+    }
+    println!("marked {marked}/{} file(s) viewed on PR #{pr_number}", done.len());
     Ok(ExitCode::SUCCESS)
 }
 

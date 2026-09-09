@@ -78,11 +78,12 @@ hunk that changes under you loses its marks automatically.
 
 Comments travel back: `C` resolves every anchor to its current line,
 quotes the line, and sends the bundle the same way as a question;
-`slidiff comments` prints it for an agent without the TUI. And when a
-file is fully seen with no flags left, `slidiff viewed` checks it off as
-Viewed on the GitHub PR; `slidiff viewed --pull` goes the other way,
-importing the PR's Viewed checkboxes as locally seen files (`--dry-run`
-to preview either; uses `gh`).
+`slidiff comments` prints it for an agent without the TUI. And the
+review state syncs with GitHub: opening a deck imports the PR's Viewed
+checkboxes as locally seen files, and `g` runs the full two-way sync —
+files fully seen here with no flags left get checked off as Viewed on
+the PR. The same works headless: `slidiff viewed` pushes, `slidiff
+viewed --pull` imports (`--dry-run` to preview either; uses `gh`).
 
 The viewer watches the repository while open: an edited deck or a changed
 diff reloads by itself, and only the hunks that actually changed fall back

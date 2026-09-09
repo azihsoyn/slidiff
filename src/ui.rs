@@ -88,6 +88,7 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
     app.start_sync(false, true);
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    let _ = crossterm::execute!(std::io::stdout(), event::EnableBracketedPaste);
     // Kitty keyboard protocol, where the terminal has it: makes
     // shift+enter distinct from enter so text inputs can take newlines.
     // Elsewhere this is ignored and shift+enter just sends.
@@ -97,6 +98,7 @@ pub fn run(deck: Deck, repo: Repo, deck_key: Option<String>) -> Result<()> {
     );
     let result = app.event_loop(&mut terminal);
     let _ = crossterm::execute!(std::io::stdout(), event::PopKeyboardEnhancementFlags);
+    let _ = crossterm::execute!(std::io::stdout(), event::DisableBracketedPaste);
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -116,10 +118,63 @@ enum SideTarget {
     File(String),
 }
 
-/// A floating one-line text input and what it is for.
+/// A floating text input and what it is for.
 struct InputBox {
     kind: InputKind,
     buf: String,
+    /// Byte offset of the insertion point; always on a char boundary.
+    cursor: usize,
+}
+
+impl InputBox {
+    fn new(kind: InputKind) -> InputBox {
+        InputBox {
+            kind,
+            buf: String::new(),
+            cursor: 0,
+        }
+    }
+
+    fn insert(&mut self, c: char) {
+        self.buf.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    fn insert_str(&mut self, s: &str) {
+        self.buf.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
+    fn left(&mut self) {
+        if let Some(c) = self.buf[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+        }
+    }
+
+    fn right(&mut self) {
+        if let Some(c) = self.buf[self.cursor..].chars().next() {
+            self.cursor += c.len_utf8();
+        }
+    }
+
+    fn backspace(&mut self) {
+        if let Some(c) = self.buf[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+            self.buf.remove(self.cursor);
+        }
+    }
+
+    /// Ctrl+W: eat whitespace behind the cursor, then the word.
+    fn delete_word(&mut self) {
+        while matches!(self.buf[..self.cursor].chars().next_back(), Some(c) if c.is_whitespace())
+        {
+            self.backspace();
+        }
+        while matches!(self.buf[..self.cursor].chars().next_back(), Some(c) if !c.is_whitespace())
+        {
+            self.backspace();
+        }
+    }
 }
 
 enum InputKind {
@@ -599,6 +654,13 @@ impl App {
                 }
                 return Ok(false);
             }
+            // Bracketed paste, straight into an open input.
+            Event::Paste(text) => {
+                if let Some(input) = &mut self.input {
+                    input.insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                }
+                return Ok(false);
+            }
             _ => return Ok(false),
         };
         let ctrl_c =
@@ -609,13 +671,14 @@ impl App {
         // An open text input swallows every key — `q` is a letter here,
         // not quit.
         if let Some(input) = &mut self.input {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Esc => self.input = None,
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    input.buf.push('\n');
+                    input.insert('\n');
                 }
                 KeyCode::Enter => {
-                    let InputBox { kind, buf } = self.input.take().unwrap();
+                    let InputBox { kind, buf, .. } = self.input.take().unwrap();
                     match kind {
                         InputKind::Ask => {
                             let prompt = self.build_ask_prompt(&buf);
@@ -630,10 +693,19 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Backspace => {
-                    input.buf.pop();
+                KeyCode::Backspace => input.backspace(),
+                KeyCode::Left => input.left(),
+                KeyCode::Right => input.right(),
+                KeyCode::Home => input.cursor = 0,
+                KeyCode::End => input.cursor = input.buf.len(),
+                KeyCode::Char('a') if ctrl => input.cursor = 0,
+                KeyCode::Char('e') if ctrl => input.cursor = input.buf.len(),
+                KeyCode::Char('w') if ctrl => input.delete_word(),
+                KeyCode::Char('u') if ctrl => {
+                    input.buf.drain(..input.cursor);
+                    input.cursor = 0;
                 }
-                KeyCode::Char(c) => input.buf.push(c),
+                KeyCode::Char(c) if !ctrl => input.insert(c),
                 _ => {}
             }
             return Ok(false);
@@ -741,10 +813,7 @@ impl App {
                 KeyCode::Char('h') => self.hide_seen = !self.hide_seen,
                 KeyCode::Char('v') => self.slide_toggle_seen(),
                 KeyCode::Char('a') => {
-                    self.input = Some(InputBox {
-                        kind: InputKind::Ask,
-                        buf: String::new(),
-                    })
+                    self.input = Some(InputBox::new(InputKind::Ask));
                 }
                 KeyCode::Char('C') => self.send_comments(),
                 KeyCode::Tab => {
@@ -1915,14 +1984,11 @@ impl App {
         let meta = self.dive_meta();
         let Some(m) = meta.get(cursor) else { return };
         if let (Some(file), Some(hash), Some(idx)) = (&m.file, &m.hunk_hash, m.changed_idx) {
-            self.input = Some(InputBox {
-                kind: InputKind::Comment {
-                    file: file.clone(),
-                    hash: hash.clone(),
-                    idx,
-                },
-                buf: String::new(),
-            });
+            self.input = Some(InputBox::new(InputKind::Comment {
+                file: file.clone(),
+                hash: hash.clone(),
+                idx,
+            }));
         }
     }
 
@@ -2532,21 +2598,23 @@ fn draw_input_popup(frame: &mut Frame, area: Rect, input: &InputBox, context: &s
         .into_iter()
         .map(|r| Line::from(r).style(Style::new().dim()))
         .collect();
-    let input_rows: Vec<String> = format!("{buf}▏")
+    let (before, after) = buf.split_at(input.cursor);
+    let text = format!("{before}▏{after}");
+    let mut cursor_row = 0usize;
+    let input_rows: Vec<String> = text
         .split('\n')
         .flat_map(|seg| wrap_display(seg, inner_w.saturating_sub(2)))
         .collect();
-    let last = input_rows.len() - 1;
     for (i, row) in input_rows.into_iter().enumerate() {
         let prompt = if i == 0 { "> " } else { "  " };
         let mut spans = vec![Span::styled(prompt, Style::new().fg(ACCENT))];
-        let mut rest = row;
-        if i == last {
-            rest.pop(); // the ▏ cursor, re-added styled
-            spans.push(Span::raw(rest));
+        if let Some(pos) = row.find('▏') {
+            cursor_row = lines.len();
+            spans.push(Span::raw(row[..pos].to_string()));
             spans.push(Span::styled("▏", Style::new().fg(ACCENT)));
+            spans.push(Span::raw(row[pos + '▏'.len_utf8()..].to_string()));
         } else {
-            spans.push(Span::raw(rest));
+            spans.push(Span::raw(row));
         }
         lines.push(Line::from(spans));
     }
@@ -2554,7 +2622,11 @@ fn draw_input_popup(frame: &mut Frame, area: Rect, input: &InputBox, context: &s
         (lines.len() as u16 + 2).clamp(4, (area.height.saturating_mul(3) / 4).max(4));
     let visible = usize::from(height - 2);
     if lines.len() > visible {
-        lines.drain(..lines.len() - visible);
+        let start = (cursor_row + 1)
+            .saturating_sub(visible)
+            .min(lines.len() - visible);
+        lines.drain(..start);
+        lines.truncate(visible);
     }
     let [_, mid, _] = Layout::vertical([
         Constraint::Fill(1),
@@ -3331,6 +3403,7 @@ diff --git a/f.rs b/f.rs
         app.input = Some(InputBox {
             kind: InputKind::Ask,
             buf: "why".into(),
+            cursor: 3,
         });
         let s = screen(&mut app);
         assert!(s.contains(" ask an agent · enter send "), "{s}");
@@ -3386,6 +3459,56 @@ diff --git a/f.rs b/f.rs
     }
 
     #[test]
+    fn input_edits_at_the_cursor() {
+        let mut b = InputBox::new(InputKind::Ask);
+        for c in "foo bar".chars() {
+            b.insert(c);
+        }
+        // ←← then type: insertion lands mid-string.
+        b.left();
+        b.left();
+        b.insert('X');
+        assert_eq!(b.buf, "foo bXar");
+        // Backspace removes what was just typed, at the cursor.
+        b.backspace();
+        assert_eq!(b.buf, "foo bar");
+        // Ctrl+W eats the word behind the cursor — "b" of "foo b|ar".
+        b.delete_word();
+        assert_eq!(b.buf, "foo ar");
+        // And again from the end: whitespace, then the whole word.
+        b.cursor = b.buf.len();
+        b.delete_word();
+        assert_eq!(b.buf, "foo ");
+        // Multibyte: the cursor walks char by char, not byte by byte.
+        let mut b = InputBox::new(InputKind::Ask);
+        b.insert('日');
+        b.insert('本');
+        b.left();
+        b.insert('全');
+        assert_eq!(b.buf, "日全本");
+        // Paste goes in at the cursor too.
+        b.insert_str("語で");
+        assert_eq!(b.buf, "日全語で本");
+    }
+
+    #[test]
+    fn paste_event_lands_in_the_open_input() {
+        let mut app = app_with(vec![Step::Point {
+            at: "src/lib.rs:11".parse().unwrap(),
+            claim: "c".into(),
+            notes: vec![],
+            speaker_notes: None,
+        }]);
+        app.input = Some(InputBox::new(InputKind::Ask));
+        let _ = app.handle_event(Event::Paste("line one\r\nline two".to_string()));
+        assert_eq!(app.input.as_ref().unwrap().buf, "line one\nline two");
+        // Without an input open, a paste is ignored, not executed as keys.
+        app.input = None;
+        let _ = app.handle_event(Event::Paste("q".to_string()));
+        assert!(app.input.is_none());
+    }
+
+    #[test]
     fn shift_enter_inserts_a_newline_instead_of_sending() {
         let mut app = app_with(vec![Step::Point {
             at: "src/lib.rs:11".parse().unwrap(),
@@ -3396,6 +3519,7 @@ diff --git a/f.rs b/f.rs
         app.input = Some(InputBox {
             kind: InputKind::Ask,
             buf: "first".into(),
+            cursor: 5,
         });
         let _ = app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
             KeyCode::Enter,
@@ -3424,9 +3548,12 @@ diff --git a/f.rs b/f.rs
             speaker_notes: None,
         }]);
         // Long Japanese question: wraps well past one popup row.
+        let buf = format!("{}終端", "こ".repeat(120));
+        let cursor = buf.len();
         app.input = Some(InputBox {
             kind: InputKind::Ask,
-            buf: format!("{}終端", "こ".repeat(120)),
+            buf,
+            cursor,
         });
         let s = screen(&mut app);
         // Wide glyphs render with a trailing continuation cell, so match
